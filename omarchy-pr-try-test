@@ -20,6 +20,11 @@ export OMARCHY_PR_REPO="test/omarchy"
 export OMARCHY_PR_DIR="$T/work"
 export OMARCHY_PR_STATE="$T/state"
 export OMARCHY_PR_CONF="$T/etc-omarchy.conf"
+# The older sections test the dev-link way; the system-files sections switch to
+# the default (system) mode and a throwaway root tree.
+export OMARCHY_PR_MODE=link
+export OMARCHY_PR_SUDO=sudo     # always go through the stand-in sudo, even if the host runs the tests as root
+SYS="$T/root"
 
 # A hermetic PATH. Anything that touches the machine, or differs from host to
 # host, is left out. So a tool that is "missing" in a test really is missing,
@@ -88,6 +93,7 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "pr view") b=$(awk -v n="$3" '$1 == n { print $2 }' "$STUB/bases"); printf '%s\tOPEN\tfalse\n' "${b:-dev}" ;;
   "pr list") cat "$STUB/list.tsv" ;;
+  "search prs") cat "$STUB/search.tsv" ;;
   "api user") echo tester ;;
   "pr comment") echo "https://github.com/test/omarchy/pull/1#issuecomment-1" ;;
 esac
@@ -113,6 +119,14 @@ cat >"$STUB/bin/omarchy-snapshot" <<'EOF'
 #!/usr/bin/env bash
 [[ ! -f "$STUB/no-snapshot" ]] || exit 1
 echo "snapshot $*" >>"$STUB/calls"
+EOF
+# sudo: runs the command as the test user (the system tree is a throwaway copy).
+# Writing omarchy-new can be made to fail, to test the rollback.
+cat >"$STUB/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+echo "sudo $*" >>"$STUB/calls"
+if [[ -f "$STUB/fail-write" && "$1" == tee && "$2" == *omarchy-new* ]]; then cat >/dev/null; exit 1; fi
+exec "$@"
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$STUB/bin/snapper"
 cat >"$STUB/bin/omarchy-version" <<'EOF'
@@ -216,13 +230,36 @@ chmod +x bin/omarchy-shellc
 printf 'Process {\nXMLHttpRequest\n' >notes.txt
 git add -A; git commit -qm "Shell script with bash -c"
 git push -q origin pr6:refs/pull/6/head
+
+# PR 7: for the system-files tests, on dev. Changes an installed command, deletes
+# one, adds one; adds a shell plugin in new folders, a theme and a config file; and
+# has things that must NOT be installed.
+git checkout -q -b pr7 dev
+printf '#!/usr/bin/env bash\necho pr7\n' >bin/omarchy-base
+git rm -q bin/omarchy-devonly
+printf '#!/usr/bin/env bash\necho new\n' >bin/omarchy-new
+printf '#!/usr/bin/env bash\necho shadow\n' >bin/ls
+ln -s omarchy-base bin/omarchy-sym
+chmod +x bin/omarchy-new bin/ls
+mkdir -p shell/plugins/bar themes/mytheme config/hypr etc/profile.d default/x install migrations docs
+printf 'Item {}\n' >shell/plugins/bar/Bar.qml
+printf 'accent = 1\n' >themes/mytheme/colors.conf
+printf -- '-- extra\n' >config/hypr/extra.lua
+printf 'export X=1\n' >etc/profile.d/x.sh
+printf 'x\n' >default/x/y
+printf 'echo hi\n' >install/foo.sh
+printf 'echo hi\n' >migrations/1700000007.sh
+printf 'notes\n' >docs/x.md
+git add -A; git commit -qm "System files PR"
+git push -q origin pr7:refs/pull/7/head
 cd "$T" || exit 2
 
-printf '1 dev\n2 dev\n3 master\n4 dev\n5 dev\n6 dev\n' >"$STUB/bases"
+printf '1 dev\n2 dev\n3 master\n4 dev\n5 dev\n6 dev\n7 dev\n' >"$STUB/bases"
 printf '1\tAdd foo\talice\t\t+3/-1\tpass\tdev\n2\tNasty\tbob\tdraft\t+9/-0\tfail\tdev\n' >"$STUB/list.tsv"
+printf '18244\tnetwork: right-click context menu\tzulhamsy\t\topen\t2026-11-09T10:00:00Z\n5000\tOld merged thing\tsomeone\t\tmerged\t2025-01-01T00:00:00Z\n7\tClosed draft idea\tpriya\tdraft\tclosed\t2025-06-15T00:00:00Z\n' >"$STUB/search.tsv"
 
 reset_world() {
-  rm -rf "$HOME" "$OMARCHY_PR_STATE" "$STUB/calls" "$STUB/no-snapshot" "$STUB/fail-unlink-once"
+  rm -rf "$HOME" "$OMARCHY_PR_STATE" "$STUB/calls" "$STUB/no-snapshot" "$STUB/fail-unlink-once" "$STUB/fail-write"
   rm -f "$OMARCHY_PR_CONF"
   mkdir -p "$HOME/.config/hypr" "$HOME/.config/omarchy/themes" "$HOME/.config/waybar" "$HOME/.local/state/omarchy"
   echo "hypr original" >"$HOME/.config/hypr/hyprland.lua"
@@ -241,6 +278,19 @@ run list
 expect_rc 0 "list works"
 expect_has "#1" "lists PR 1"
 expect_has "→ dev" "shows the base branch"
+
+section "search: every PR, open closed and merged"
+run search context
+expect_rc 0 "search runs"
+expect_has "#18244" "finds the matching open PR"
+expect_has "[open]" "marks open PRs"
+expect_has "#5000" "includes merged PRs"
+expect_has "[merged]" "marks merged PRs"
+expect_has "#7" "includes closed PRs"
+expect_has "[draft]" "marks drafts"
+expect_has "@zulhamsy" "shows the author"
+run search --open context
+expect_has "[open]" "--open filter runs"
 
 section "risk: the base branch is the PR's own, not the default"
 run risk 1
@@ -533,6 +583,215 @@ rm -f "$OMARCHY_PR_STATE/reviewed/pr-1"
 runy try 1 "${new:0:7}"
 expect_rc 0 "an unreviewed PR can be tried with the pinned SHA"
 runy back
+
+
+# ------------------------------------------------------------ system files
+
+# A throwaway "installed Omarchy 4": commands in usr/bin, the rest in usr/share/omarchy.
+reset_sys() {
+  rm -rf "$SYS"
+  mkdir -p "$SYS/usr/bin" "$SYS/usr/share/omarchy/bin" "$SYS/usr/share/omarchy/shell" "$SYS/usr/share/omarchy/themes" "$SYS/etc"
+  printf '#!/usr/bin/env bash\necho system-base\n' >"$SYS/usr/bin/omarchy-base"
+  printf '#!/usr/bin/env bash\necho system-devonly\n' >"$SYS/usr/bin/omarchy-devonly"
+  printf '#!/usr/bin/env bash\necho system-devonly-copy\n' >"$SYS/usr/share/omarchy/bin/omarchy-devonly"
+  ln -s ../../../bin/omarchy-base "$SYS/usr/share/omarchy/bin/omarchy-base"
+  chmod +x "$SYS/usr/bin/"* "$SYS/usr/share/omarchy/bin/omarchy-devonly"
+  echo "root file" >"$SYS/etc/untouched"
+}
+# (var/ holds the tool's own private folder, which is deleted but whose parents stay, like on a real system)
+sys_hash() { (cd "$SYS" && find . -path ./var -prune -o \( -type f -o -type l \) -print0 | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null; find . -path ./var -prune -o -type d -print | LC_ALL=C sort) | sha256sum; }
+
+export OMARCHY_PR_MODE=system
+export OMARCHY_PR_SYSROOT="$SYS"
+OLD_PATH="$PATH"
+export PATH="$SYS/usr/bin:$PATH"
+
+section "system: plan shows where each file goes and changes nothing"
+reset_world; reset_sys
+sys_before=$(sys_hash)
+run plan 7
+expect_rc 0 "plan runs"
+expect_has "bin/omarchy-base" "names the repo file"
+expect_has "→ /usr/bin/omarchy-base" "a command goes to /usr/bin"
+expect_has "replaces the current file" "says it replaces the installed one"
+expect_has "→ /usr/bin/omarchy-new   (new)" "a new command is marked new"
+expect_has "→ /usr/bin/omarchy-devonly   (removed)" "a command the PR deletes is marked removed"
+expect_has "→ /usr/share/omarchy/bin/omarchy-devonly   (removed)" "and so is its real copy in /usr/share/omarchy/bin"
+expect_lacks "/usr/share/omarchy/bin/omarchy-base" "a symlink copy in /usr/share/omarchy/bin is left alone"
+expect_has "→ /usr/share/omarchy/shell/plugins/bar/Bar.qml" "shell files go to /usr/share/omarchy/shell"
+expect_has "→ /usr/share/omarchy/themes/mytheme/colors.conf" "themes go to /usr/share/omarchy/themes"
+expect_has "→ ~/.config/hypr/extra.lua" "config goes to ~/.config"
+expect_has "Not applied:" "lists what is not applied"
+expect_has "etc/profile.d/x.sh: installed under /etc" "etc/ is not applied, with a reason"
+expect_has "default/x/y: installed by the omarchy-settings package" "default/ is not applied"
+expect_has "install/foo.sh" "install/ is not applied"
+expect_has "migrations/1700000007.sh" "migrations/ are not applied"
+expect_has "bin/ls: not an omarchy command name" "a command that is not omarchy-* is never put in /usr/bin"
+expect_has "bin/omarchy-sym: a symlink" "a symlink is never installed"
+expect_lacks "docs/x.md" "docs are not mentioned"
+expect_has "Nothing was changed" "says nothing changed"
+expect "the system tree is untouched" test "$sys_before" = "$(sys_hash)"
+expect_not "no state" test -f "$OMARCHY_PR_STATE/active"
+
+section "system: try puts the files into the system, back puts them back"
+reset_world; reset_sys
+sys_before=$(sys_hash)
+runy try 7
+expect_rc 0 "try 7 succeeds"
+expect "the installed command now holds the PR's version" grep -q 'echo pr7' "$SYS/usr/bin/omarchy-base"
+expect "and keeps its executable bit" test -x "$SYS/usr/bin/omarchy-base"
+expect "a new command is there" grep -q 'echo new' "$SYS/usr/bin/omarchy-new"
+expect_not "the deleted command is gone" test -e "$SYS/usr/bin/omarchy-devonly"
+expect_not "and its real copy in /usr/share/omarchy/bin" test -e "$SYS/usr/share/omarchy/bin/omarchy-devonly"
+expect "the symlink copy in /usr/share/omarchy/bin is still a symlink" test -L "$SYS/usr/share/omarchy/bin/omarchy-base"
+expect "shell plugin is in new folders" grep -q 'Item' "$SYS/usr/share/omarchy/shell/plugins/bar/Bar.qml"
+expect "theme file is there" grep -q accent "$SYS/usr/share/omarchy/themes/mytheme/colors.conf"
+expect "plain files are 644" test "$(stat -c %a "$SYS/usr/share/omarchy/themes/mytheme/colors.conf")" = 644
+expect "config file is in ~/.config" test -f "$HOME/.config/hypr/extra.lua"
+expect_not "etc is not touched" test -e "$SYS/etc/profile.d/x.sh"
+expect_not "bin/ls was not installed" test -e "$SYS/usr/bin/ls"
+expect_not "no dev-link was written" test -f "$OMARCHY_PR_CONF"
+expect_not "dev-link was never called" grep -q '^link' "$STUB/calls"
+expect "sudo was used for the system files" grep -q '^sudo ' "$STUB/calls"
+expect "took a snapshot first" grep -q '^snapshot create' "$STUB/calls"
+expect "state says system mode" grep -qx 'mode=system' "$OMARCHY_PR_STATE/active"
+expect "originals are kept in a private folder" test "$(stat -c %a "$SYS/var/lib/omarchy-pr-try")" = 700
+expect "with a manifest" test -s "$SYS/var/lib/omarchy-pr-try/manifest.tsv"
+expect "and the user config backup is made too" grep -qx '.config/hypr' "$OMARCHY_PR_STATE/backup.paths"
+expect_has "PR #7 is now in your system" "says the PR is in the system"
+expect_has "✓ /usr/bin/omarchy-base   in place" "lists each file as in place"
+expect_has "✓ /usr/bin/omarchy-new   in place (new)" "marks new files"
+expect_has "no reboot is needed" "says no reboot is needed"
+expect_has "restart it to see the change" "says the shell must be restarted for QML"
+expect_lacks "Reboot now" "does not offer a reboot"
+run verify
+expect_has "mode: system" "verify shows the mode"
+expect_has "All of the PR's files are in place and nothing hides them." "verify is happy"
+run status
+expect_has "mode: system files" "status shows the mode"
+mkdir -p "$T/shadow"; printf '#!/usr/bin/env bash\n' >"$T/shadow/omarchy-new"; chmod +x "$T/shadow/omarchy-new"
+OLDP="$PATH"; PATH="$T/shadow:$PATH"
+run verify
+PATH="$OLDP"
+expect_has "your shell runs omarchy-new from $T/shadow" "verify catches a command hidden earlier in PATH"
+expect_has "Something above is not as it should be" "and says so"
+rm -rf "$T/shadow"
+runy try 1
+expect_rc 1 "a second try is refused while one is active"
+runy back
+expect_rc 0 "back succeeds"
+expect "every system file is exactly as before" test "$sys_before" = "$(sys_hash)"
+expect_not "the folders the PR created are gone" test -d "$SYS/usr/share/omarchy/shell/plugins"
+expect_not "the private folder is gone" test -e "$SYS/var/lib/omarchy-pr-try"
+expect_not "the config file the PR added is gone" test -e "$HOME/.config/hypr/extra.lua"
+expect "your config is back" grep -qx 'hypr original' "$HOME/.config/hypr/hyprland.lua"
+expect_not "state file is gone" test -f "$OMARCHY_PR_STATE/active"
+expect_not "dev-link was never touched" grep -q '^unlink' "$STUB/calls"
+expect_has "Put back: the system files this tool replaced" "back says what was put back"
+expect_has "The original system files and your config are back" "back says it is done"
+expect_lacks "Reboot to finish" "no reboot asked"
+run history
+expect_has "System files PR" "history row written"
+
+section "system: a file a package update replaced meanwhile is left alone"
+reset_world; reset_sys
+runy try 7
+echo "pacman put this here" >"$SYS/usr/bin/omarchy-base"
+runy back
+expect_rc 0 "back still finishes"
+expect_has "/usr/bin/omarchy-base changed since the PR was installed" "warns about the newer file"
+expect "the newer file is kept" grep -qx 'pacman put this here' "$SYS/usr/bin/omarchy-base"
+expect "the other files are restored" grep -q 'system-devonly' "$SYS/usr/bin/omarchy-devonly"
+expect_not "the PR's new command is removed" test -e "$SYS/usr/bin/omarchy-new"
+
+section "system: a failed write rolls everything back"
+reset_world; reset_sys
+sys_before=$(sys_hash)
+touch "$STUB/fail-write"
+runy try 7
+expect_rc 1 "try fails"
+expect_has "could not write /usr/bin/omarchy-new" "says which file failed"
+expect_has "putting back what was already replaced" "says it is rolling back"
+expect "the system is exactly as before" test "$sys_before" = "$(sys_hash)"
+expect_not "no state left behind" test -f "$OMARCHY_PR_STATE/active"
+rm -f "$STUB/fail-write"
+
+section "system: an interrupted try can be undone"
+reset_world; reset_sys
+sys_before=$(sys_hash)
+runy try 7
+# pretend it crashed before the end
+sed -i 's/^phase=.*/phase=linking/' "$OMARCHY_PR_STATE/active"
+run status
+expect_has "the switch did not finish" "status says so"
+runy back
+expect_rc 0 "back undoes it"
+expect "the system is exactly as before" test "$sys_before" = "$(sys_hash)"
+
+section "system: a tampered backup stops back"
+reset_world; reset_sys
+runy try 7
+echo tamper >>"$SYS/var/lib/omarchy-pr-try/backup.tar.gz"
+runy back
+expect_rc 1 "checksum mismatch stops back"
+expect_has "checksum" "says why"
+expect "state is kept" test -f "$OMARCHY_PR_STATE/active"
+expect "the PR's files are still in place" grep -q 'echo pr7' "$SYS/usr/bin/omarchy-base"
+expect "your config was not touched yet" test -f "$HOME/.config/hypr/extra.lua"
+
+section "system: a manifest path outside the allowed places is refused"
+reset_world; reset_sys
+runy try 7
+printf 'M\t/etc/shadow\tabc\tdef\n' >>"$SYS/var/lib/omarchy-pr-try/manifest.tsv"
+runy back
+expect_has "will not touch" "an unexpected path in the manifest is skipped"
+expect_rc 1 "and back reports a problem"
+expect "/etc is untouched" grep -qx 'root file' "$SYS/etc/untouched"
+
+section "system: nothing to install, wrong layout, existing dev-link"
+reset_world; reset_sys
+runy try 3
+expect_rc 1 "a PR with only non-installable files is refused"
+expect_has "nothing in this PR can be put into the system directly" "and says why"
+expect_not "no state left behind" test -f "$OMARCHY_PR_STATE/active"
+rm -rf "$SYS/usr/share/omarchy"
+runy try 1
+expect_rc 1 "a machine without /usr/share/omarchy is refused"
+expect_has "does not look like a packaged Omarchy 4" "and says so"
+expect_has "--link" "and suggests --link"
+reset_sys
+printf 'export OMARCHY_PATH="%s"\n' "$T/my-dev-checkout" >"$OMARCHY_PR_CONF"
+runy try 1
+expect_rc 1 "an existing dev-link is refused (it would hide the files)"
+expect_has "dev-link to $T/my-dev-checkout" "and names it"
+expect_not "nothing was written" test -e "$SYS/usr/bin/omarchy-foo"
+
+section "system: --link still switches with the dev-link"
+reset_world; reset_sys
+runy try 1 --link
+expect_rc 0 "try --link works"
+expect "dev-link points at the checkout" grep -q "$OMARCHY_PR_DIR/checkout" "$OMARCHY_PR_CONF"
+expect_not "the system files were not touched" test -e "$SYS/usr/bin/omarchy-foo"
+expect "state says link mode" grep -qx 'mode=link' "$OMARCHY_PR_STATE/active"
+# a state file from before system mode has no mode line at all: it is a dev-link
+sed -i '/^mode=/d' "$OMARCHY_PR_STATE/active"
+runy back
+expect_rc 0 "back handles a state file with no mode"
+expect_not "dev-link is gone" test -f "$OMARCHY_PR_CONF"
+OMARCHY_PR_MODE=bogus runy try 1
+expect_rc 1 "a bad OMARCHY_PR_MODE is rejected"
+run try 1 --nope
+expect_rc 1 "an unknown option is rejected"
+
+section "system: doctor knows about it"
+reset_sys
+run doctor
+expect_has "packaged Omarchy found" "doctor sees the installed layout"
+expect_has "sudo: found" "doctor checks sudo"
+
+export PATH="$OLD_PATH"
+unset OMARCHY_PR_SYSROOT
+export OMARCHY_PR_MODE=link
 
 section "lock"
 reset_world

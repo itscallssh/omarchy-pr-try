@@ -3,10 +3,16 @@
 # your own machine, and go back.
 #
 #   omarchy-pr-try              menu: browse PRs, then risk / checks / try
-#   omarchy-pr-try list         print open PRs
+#   omarchy-pr-try list         print ALL open PRs
+#   omarchy-pr-try search QUERY search every PR by words from the title, body
+#                               or comments — open, closed and merged
+#                               (add --open, --closed or --merged to narrow;
+#                               GitHub operators like author:name work too)
 #   omarchy-pr-try risk N       risk summary for PR N (remembers the commit you reviewed)
 #   omarchy-pr-try test N       run checks on PR N (syntax, plus the repo's tests in a sandbox)
-#   omarchy-pr-try try N [SHA]  switch this machine to PR N (SHA pins the exact commit)
+#   omarchy-pr-try plan N       show which system files PR N would replace (changes nothing)
+#   omarchy-pr-try try N [SHA]  put PR N's files into the real system (SHA pins the exact commit)
+#                               --link: old behaviour, only point OMARCHY_PATH at a checkout
 #   omarchy-pr-try back         undo, then log how it went
 #   omarchy-pr-try status       show which PR is active
 #   omarchy-pr-try history      PRs you have tried
@@ -14,15 +20,20 @@
 #                               ('good' = a "tested, works for me" note)
 #   omarchy-pr-try clean        delete the downloaded PR code and saved copies
 #   omarchy-pr-try doctor       check that everything this tool needs is there
-#   omarchy-pr-try verify       check which PR is active and whether it is really
-#                               being used by new shell sessions
+#   omarchy-pr-try verify       check which PR is active and whether its files are
+#                               really in place and being used
 #   omarchy-pr-try install      add a launcher entry and show a keybinding
 #
-# Needs Omarchy 4 (Quattro): it switches with omarchy-dev-link / omarchy-dev-unlink.
+# Needs Omarchy 4 (Quattro). By default `try` writes the PR's changed files over the
+# real ones (/usr/bin, /usr/share/omarchy, ~/.config) so the running system uses them
+# at once; `back` puts the originals back. With --link it switches with
+# omarchy-dev-link / omarchy-dev-unlink instead (needs a reboot to take effect).
 # DRAFT: tested against a fake repo with stand-in commands, not on a real Omarchy install.
 # Read it first, and try it on a spare machine or VM.
 #
 # Environment (all optional):
+#   OMARCHY_PR_MODE=system|link          how `try` puts the PR in place (default: system)
+#   OMARCHY_PR_SUDO=doas                 the command that gets root for /usr (default: sudo)
 #   OMARCHY_PR_REPO, OMARCHY_PR_REMOTE   which repo to use (default omacom/omarchy)
 #   OMARCHY_PR_DIR, OMARCHY_PR_STATE     where downloads and state live
 #   OMARCHY_PR_YES=1                     answer "yes" to ordinary prompts (never to
@@ -41,7 +52,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
   exit 1
 fi
 
-VERSION="0.3.2"
+VERSION="0.4.0"
 
 REPO="${OMARCHY_PR_REPO:-omacom/omarchy}"
 REMOTE="${OMARCHY_PR_REMOTE:-https://github.com/$REPO.git}"
@@ -60,6 +71,16 @@ DISPLACED_DIR="$STATE/displaced"
 OMARCHY_CONF="${OMARCHY_PR_CONF:-/etc/omarchy.conf}"
 BACKUP_MAX_MB="${OMARCHY_PR_BACKUP_MAX_MB:-500}"
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# System mode. SYSROOT is empty on a real machine; the tests point it at a
+# throwaway tree so nothing real is touched.
+MODE="${OMARCHY_PR_MODE:-system}"
+SYSROOT="${OMARCHY_PR_SYSROOT:-}"
+SYS_STATE="${OMARCHY_PR_SYS_STATE:-$SYSROOT/var/lib/omarchy-pr-try}"   # root-owned: the originals of replaced system files
+SYS_BACKUP="$SYS_STATE/backup.tar.gz"
+SYS_BACKUP_SUM="$SYS_STATE/backup.sha256"
+SYS_MANIFEST="$SYS_STATE/manifest.tsv"
+SYS_VIEW="$STATE/system.manifest"       # readable copy, only for verify/status
 
 # Always backed up and restored (relative to $HOME). Paths that the PR's own
 # config/ changes touch are added automatically, see derive_backup_paths.
@@ -423,7 +444,9 @@ _show_pr_header() { # pr
 
 # shellcheck disable=SC2016  # the $ and \( in the jq programs are jq's, not the shell's
 list_tsv() {
-  local limit="${OMARCHY_PR_LIMIT:-100}"
+  # All open PRs, fetched page by page (the repo has over a thousand; gh
+  # pages internally to reach the limit). Override with OMARCHY_PR_LIMIT.
+  local limit="${OMARCHY_PR_LIMIT:-1000}"
   if gh_ready; then
     gh pr list -R "$REPO" --state open --limit "$limit" \
       --json number,title,author,isDraft,additions,deletions,statusCheckRollup,baseRefName \
@@ -453,6 +476,47 @@ cmd_list() {
   list_tsv | sanitize | awk -F'\t' '{
     printf "#%-6s %-9s %s (@%s) %s%s%s\n", $1, "[" $6 "]", $2, $3, $5, ($4 == "draft" ? " [draft]" : ""), ($7 != "" ? " → " $7 : "")
   }'
+}
+
+# ---------------------------------------------------------------- search
+
+# Full-text search over EVERY PR in the repo — open, closed and merged —
+# using GitHub's PR search (matches words in the title, body and comments).
+# GitHub's own operators work in the query: author:someone label:bug is:open.
+cmd_search() { # [QUERY words...] [--open|--closed|--merged]
+  local state="all" words=() a
+  for a in "$@"; do
+    case "$a" in
+      --open) state="open" ;;
+      --closed) state="closed" ;;
+      --merged) state="merged" ;;
+      *) words+=("$a") ;;
+    esac
+  done
+  local q="${words[*]:-}"
+  [[ -n "${q//[[:space:]]/}" ]] || die "usage: omarchy-pr-try search [--open|--closed|--merged] QUERY"
+  if ! gh_ready; then
+    die "search needs gh logged in (run: gh auth login). Meanwhile, 'list' shows all open PRs"
+  fi
+  local args=(--repo "$REPO" --limit "${OMARCHY_PR_SEARCH_LIMIT:-200}")
+  case "$state" in
+    open) args+=(--state open) ;;
+    closed) args+=(--state closed) ;;
+    merged) args+=(--merged) ;;
+  esac
+  # Each word is passed separately: gh joins them into one search query, and
+  # operators like author:name only work when they are their own term.
+  gh search prs "${args[@]}" "${words[@]}" \
+    --json number,title,author,isDraft,state,updatedAt \
+    --jq 'sort_by(-.number) | .[] | [ .number,
+           (.title | gsub("[\\t\\n]"; " ")),
+           (.author.login // "?"),
+           (if .isDraft then "draft" else "" end),
+           (.state | ascii_downcase),
+           (.updatedAt | split("T")[0]) ] | @tsv' \
+    | sanitize | awk -F'\t' '{
+        printf "#%-6s %-9s %s (@%s)%s  updated %s\n", $1, "[" $5 "]", $2, $3, ($4 == "draft" ? " [draft]" : ""), $6
+      }'
 }
 
 # ---------------------------------------------------------------- risk scan
@@ -789,26 +853,459 @@ preflight_link() {
   die "omarchy-dev-link / omarchy-dev-unlink not found. They ship with Omarchy 4 (Quattro); this tool cannot switch an older install."
 }
 
+# After a dev-link (--link mode): say what is and is not active, then offer a reboot.
 offer_reboot() {
-  local pr=$(meta pr 2>/dev/null)
+  local pr
+  pr=$(meta pr 2>/dev/null || true)
   echo
   echo "PR #$pr is now active:"
   echo "  commit   $(meta sha 2>/dev/null | cut -c1-12)  ·  $(meta title 2>/dev/null | sanitize | head -c 60)"
   echo "  base     $(meta base 2>/dev/null | sanitize)"
-  echo "  /etc/omarchy.conf now points at the downloaded PR code"
+  echo "  /etc/omarchy.conf now points at the downloaded PR code ($CHECKOUT)"
   echo "  new terminal shells will use this code immediately"
   if is_tty && { [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || command -v hyprctl >/dev/null 2>&1; }; then
     echo "  a running graphical session will NOT hot-reload these changes"
     echo "  (the dock, themes and QML plugins only appear after a session restart)"
   fi
   echo
-  echo "  verify in a new shell:"
-  echo "    command -v omarchy-dock"
-  echo "  → should resolve to $CHECKOUT/bin/omarchy-dock"
+  echo "  check it any time with: omarchy-pr-try verify"
   echo
-  if confirm_always "Reboot now so the whole session uses the PR's code?"; then
+  reboot_prompt "Reboot now so the whole session uses the PR's code?"
+}
+
+reboot_prompt() { # question
+  if confirm_always "$1"; then
     if has omarchy-system-reboot; then omarchy-system-reboot; else systemctl reboot; fi
   fi
+}
+
+# ---------------------------------------------------------------- system install
+#
+# The default way to try a PR. Omarchy 4 is a package: its commands live in
+# /usr/bin and the rest in /usr/share/omarchy. A dev-link only changes a variable
+# that programs read when they START, so a session that is already running (the
+# compositor, the shell, the bar, keybindings) keeps using the old files, and the
+# PR seems not to be there. So instead the PR's changed files are written over the
+# real ones, and everything that runs from now on uses them.
+#
+#   bin/omarchy*        ->  /usr/bin/omarchy*   (and /usr/share/omarchy/bin/ when that holds a real copy)
+#   themes/  shell/     ->  /usr/share/omarchy/themes/  /usr/share/omarchy/shell/
+#   config/             ->  ~/.config/          (the folders are backed up, as always)
+#
+# Not applied, and listed as such: install/ migrations/ (run at install/update time),
+# etc/ default/ applications/ (owned by the omarchy-settings package; these need a
+# package rebuild). The originals of everything replaced are saved in a root-owned
+# folder, with a checksum of what was installed, so `back` can tell a file it must
+# restore from one that a package update has replaced since.
+
+# Run a command as root. Through sudo (or OMARCHY_PR_SUDO, e.g. doas) unless we are
+# already root and no command was asked for.
+SUDO="${OMARCHY_PR_SUDO:-sudo}"
+priv() { if [[ -z "${OMARCHY_PR_SUDO:-}" && "${EUID:-$(id -u)}" -eq 0 ]]; then "$@"; else "$SUDO" "$@"; fi; }
+
+sys_auth() { # ask for the password once, up front
+  if [[ -z "${OMARCHY_PR_SUDO:-}" && "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
+  has "$SUDO" || die "$SUDO is needed to write to /usr, and it is not installed"
+  priv true || die "could not get root rights; nothing was changed"
+}
+
+# Files this tool may ever write to or restore, as paths without $SYSROOT.
+sys_dest_ok() {
+  local d="$1"
+  case "$d" in *..* | *//* | */./* | */.) return 1 ;; esac
+  [[ "$d" =~ ^/usr/bin/omarchy(-[A-Za-z0-9._-]+)?$ ]] && return 0
+  [[ "$d" =~ ^/usr/share/omarchy/(bin|themes|shell)/[A-Za-z0-9._@+,=-]+(/[A-Za-z0-9._@+,=-]+)*$ ]]
+}
+
+sys_sha() { # dest -> sha256 of the regular file there, "-" when absent, "?" when it is not a plain file
+  local f="$SYSROOT$1"
+  if [[ -L "$f" || ( -e "$f" && ! -f "$f" ) ]]; then echo '?'; return 0; fi
+  [[ -e "$f" ]] || { echo '-'; return 0; }
+  sha256sum -- "$f" 2>/dev/null | cut -d' ' -f1 || echo '?'
+}
+
+blob_sha() { g cat-file blob "$1" | sha256sum | cut -d' ' -f1; }
+
+sys_precheck() { # before anything is fetched or asked
+  local cur
+  if [[ ! -d "$SYSROOT/usr/share/omarchy" ]] || ! compgen -G "$SYSROOT/usr/bin/omarchy-*" >/dev/null; then
+    die "this does not look like a packaged Omarchy 4 (no /usr/share/omarchy or /usr/bin/omarchy-*)."$'\n'"  Use 'omarchy-pr-try try N --link' to switch with a dev-link instead."
+  fi
+  cur=$(current_link_path)
+  if [[ -n "$cur" && "$cur" != /usr/share/omarchy ]]; then
+    die "you have a dev-link to $cur, and its bin/ comes first in PATH, so files written to /usr would be hidden behind it."$'\n'"  Run omarchy-dev-unlink (and reboot) first, or use --link."
+  fi
+}
+
+TITLE_NOW=""
+SHELL_CHANGED=0
+HYPR_CHANGED=0
+
+# ---- the plan: which PR file goes where
+
+PLAN_KIND=(); PLAN_DEST=(); PLAN_SRC=(); PLAN_MODE=(); PLAN_BLOB=(); PLAN_ORIG=(); PLAN_NEW=()   # system files
+USER_REL=(); USER_SRC=(); USER_MODE=(); USER_BLOB=()                                              # files under ~/.config
+PLAN_SKIP=()                                                                                      # "path<TAB>reason"
+PLAN_SAME=0
+
+# What the repo path means on this machine. Prints "sys<TAB>dest", "user<TAB>rel",
+# "skip<TAB>reason" or "ignore" lines.
+map_path() { # repo-path
+  local p="$1" name top rest
+  top="${p%%/*}"
+  case "$p" in
+    bin/*)
+      name="${p#bin/}"
+      if [[ "$name" =~ ^omarchy(-[A-Za-z0-9._-]+)?$ ]]; then
+        printf 'sys\t/usr/bin/%s\n' "$name"
+        if [[ -f "$SYSROOT/usr/share/omarchy/bin/$name" && ! -L "$SYSROOT/usr/share/omarchy/bin/$name" ]]; then
+          printf 'sys\t/usr/share/omarchy/bin/%s\n' "$name"
+        fi
+      else
+        printf 'skip\tnot an omarchy command name, so it is never put in /usr/bin\n'
+      fi ;;
+    themes/* | shell/*)
+      if sys_dest_ok "/usr/share/omarchy/$p"; then
+        printf 'sys\t/usr/share/omarchy/%s\n' "$p"
+      else
+        printf 'skip\tunusual characters in the path\n'
+      fi ;;
+    config/*)
+      rest="${p#config/}"
+      if valid_rel ".config/$rest"; then printf 'user\t.config/%s\n' "$rest"; else printf 'skip\tunusual characters in the path\n'; fi ;;
+    install/* | migrations/*) printf 'skip\tinstall and update scripts run at install/update time, they are not hot-applied\n' ;;
+    etc/*)          printf 'skip\tinstalled under /etc by the omarchy-settings package; needs a package rebuild\n' ;;
+    default/*)      printf 'skip\tinstalled by the omarchy-settings package; needs a package rebuild\n' ;;
+    applications/*) printf 'skip\ttemplate for new users (/etc/skel); needs a package rebuild\n' ;;
+    *)
+      case "$top" in
+        docs | doc | test | tests | agents | .github | .gitignore | .gitmodules | .gitattributes | version | *.md | LICENSE* | COPYING*) echo ignore ;;
+        *) printf 'skip\tnot something this tool installs (%s)\n' "$top" ;;
+      esac ;;
+  esac
+}
+
+# Fills the PLAN_* / USER_* arrays from the PR's own changes (RANGE). Call after fetch_pr.
+plan_build() {
+  local meta path omode nmode osha nsha st kind dest line mode cur new rel
+  PLAN_KIND=(); PLAN_DEST=(); PLAN_SRC=(); PLAN_MODE=(); PLAN_BLOB=(); PLAN_ORIG=(); PLAN_NEW=()
+  USER_REL=(); USER_SRC=(); USER_MODE=(); USER_BLOB=(); PLAN_SKIP=(); PLAN_SAME=0
+  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+    read -r omode nmode osha nsha st <<<"${meta#:}"
+    path=$(clean "$path")
+    while IFS= read -r line; do
+      kind="${line%%$'\t'*}"; dest="${line#*$'\t'}"
+      case "$kind" in
+        ignore) continue ;;
+        skip) PLAN_SKIP+=("$path"$'\t'"$dest"); continue ;;
+      esac
+      if [[ "$nmode" == 120000 || "$nmode" == 160000 ]]; then
+        PLAN_SKIP+=("$path"$'\t'"a symlink or submodule is never installed"); continue
+      fi
+      if [[ "$nmode" == 000000 ]]; then   # the PR deletes the file
+        if [[ "$kind" == user ]]; then PLAN_SKIP+=("$path"$'\t'"deleted by the PR; your own config file is left alone"); continue; fi
+        cur=$(sys_sha "$dest")
+        if [[ "$cur" == '-' ]]; then continue; fi
+        if [[ "$cur" == '?' ]]; then PLAN_SKIP+=("$path"$'\t'"the file on this system is a symlink or not a plain file"); continue; fi
+        PLAN_KIND+=(R); PLAN_DEST+=("$dest"); PLAN_SRC+=("$path"); PLAN_MODE+=(-); PLAN_BLOB+=(-); PLAN_ORIG+=("$cur"); PLAN_NEW+=(-)
+        continue
+      fi
+      case "$nmode" in 100755) mode=755 ;; 100644) mode=644 ;; *) PLAN_SKIP+=("$path"$'\t'"unusual file mode $nmode"); continue ;; esac
+      if [[ "$kind" == user ]]; then
+        USER_REL+=("$dest"); USER_SRC+=("$path"); USER_MODE+=("$mode"); USER_BLOB+=("$nsha")
+        continue
+      fi
+      cur=$(sys_sha "$dest")
+      if [[ "$cur" == '?' ]]; then PLAN_SKIP+=("$path"$'\t'"the file on this system is a symlink or not a plain file"); continue; fi
+      new=$(blob_sha "$nsha")
+      if [[ "$cur" == "$new" ]]; then PLAN_SAME=$((PLAN_SAME + 1)); continue; fi
+      if [[ "$cur" == '-' ]]; then PLAN_KIND+=(A); else PLAN_KIND+=(M); fi
+      PLAN_DEST+=("$dest"); PLAN_SRC+=("$path"); PLAN_MODE+=("$mode"); PLAN_BLOB+=("$nsha"); PLAN_ORIG+=("$cur"); PLAN_NEW+=("$new")
+    done < <(map_path "$path")
+  done < <(g diff --raw -z --no-abbrev --no-renames "$RANGE")
+  if (( ${#PLAN_DEST[@]} > 500 )); then die "this PR would replace ${#PLAN_DEST[@]} system files; that is more than I will do. Use --link."; fi
+}
+
+plan_empty() { (( ${#PLAN_DEST[@]} == 0 && ${#USER_REL[@]} == 0 )); }
+
+plan_show() { # pr
+  local i k what n
+  echo
+  echo "Files from PR #$1 that go into your system:"
+  if plan_empty; then
+    echo "  (none: nothing in this PR can be applied directly)"
+  fi
+  for i in "${!PLAN_DEST[@]}"; do
+    case "${PLAN_KIND[i]}" in A) what="new" ;; M) what="replaces the current file" ;; R) what="removed" ;; esac
+    printf '  %-34s → %s   (%s)\n' "${PLAN_SRC[i]}" "${PLAN_DEST[i]}" "$what" | sanitize
+  done
+  for i in "${!USER_REL[@]}"; do
+    printf '  %-34s → ~/%s   (your config, backed up)\n' "${USER_SRC[i]}" "${USER_REL[i]}" | sanitize
+  done
+  if (( PLAN_SAME > 0 )); then echo "  ($PLAN_SAME files are already identical on this system)"; fi
+  if (( ${#PLAN_SKIP[@]} )); then
+    echo
+    echo "Not applied:"
+    n=0
+    for k in "${PLAN_SKIP[@]}"; do
+      n=$((n + 1))
+      if (( n > 8 )); then echo "  (+$(( ${#PLAN_SKIP[@]} - 8 )) more)"; break; fi
+      printf '  %s: %s\n' "${k%%$'\t'*}" "${k#*$'\t'}" | sanitize
+    done
+  fi
+}
+
+# ---- applying
+
+# Directories that do not exist yet for the given destinations, shallowest first.
+missing_dirs() { # dest...
+  local d dir
+  for d in "$@"; do
+    dir=$(dirname "$d")
+    while [[ ! -d "$SYSROOT$dir" && "$dir" != / && "$dir" != . ]]; do
+      printf '%s\n' "$dir"
+      dir=$(dirname "$dir")
+    done
+  done | LC_ALL=C sort -u
+}
+
+write_blob() { # blob mode dest-file   (as root when $4 is "priv")
+  local blob="$1" mode="$2" dest="$3" as="${4:-}" tmp
+  tmp="$dest.omarchy-pr-try.new"
+  if [[ "$as" == priv ]]; then
+    g cat-file blob "$blob" | priv tee "$tmp" >/dev/null || return 1
+    priv chmod "$mode" "$tmp" && priv mv -f -- "$tmp" "$dest"
+  else
+    g cat-file blob "$blob" >"$tmp" || { rm -f "$tmp"; return 1; }
+    chmod "$mode" "$tmp" && mv -f -- "$tmp" "$dest"
+  fi
+}
+
+# Save the originals, write the manifest, then replace the files. Returns 1 on failure
+# (and puts back whatever it had already replaced).
+sys_apply() { # pr
+  local i dest tmpl dirs=() keep=() line view n
+  for i in "${!PLAN_DEST[@]}"; do
+    [[ "${PLAN_KIND[i]}" == A ]] || keep+=("${PLAN_DEST[i]#/}")
+    sys_dest_ok "${PLAN_DEST[i]}" || die "refusing to touch ${PLAN_DEST[i]}"
+  done
+
+  priv install -d -m 700 "$SYS_STATE"
+  priv rm -f -- "$SYS_BACKUP" "$SYS_BACKUP_SUM" "$SYS_MANIFEST"
+  if (( ${#keep[@]} )); then
+    note "saving the ${#keep[@]} system files that will be replaced"
+    printf '%s\0' "${keep[@]}" | priv tar -C "$SYSROOT/" --null -T - -czpf "$SYS_BACKUP" \
+      || { priv rm -f -- "$SYS_BACKUP"; die "could not back up the system files; nothing was changed"; }
+    n=$(priv tar -tzf "$SYS_BACKUP" | grep -vc '/$' || true)
+    (( n >= ${#keep[@]} )) || { priv rm -f -- "$SYS_BACKUP"; die "the system backup is incomplete; nothing was changed"; }
+    priv sha256sum "$SYS_BACKUP" | cut -d' ' -f1 | priv tee "$SYS_BACKUP_SUM" >/dev/null
+  fi
+
+  mapfile -t dirs < <(missing_dirs "${PLAN_DEST[@]}")
+  line=""
+  for i in "${!PLAN_DEST[@]}"; do
+    line+="${PLAN_KIND[i]}"$'\t'"${PLAN_DEST[i]}"$'\t'"${PLAN_ORIG[i]}"$'\t'"${PLAN_NEW[i]}"$'\n'
+  done
+  for dest in "${dirs[@]}"; do
+    [[ -n "$dest" ]] && line+="D"$'\t'"$dest"$'\t-\t-\n'
+  done
+  printf '%s' "$line" | priv tee "$SYS_MANIFEST" >/dev/null
+  view="$line"
+  for i in "${!USER_REL[@]}"; do
+    view+="U"$'\t'"${USER_REL[i]}"$'\t-\t'"$(blob_sha "${USER_BLOB[i]}")"$'\n'
+  done
+  ensure_state
+  printf '%s' "$view" >"$SYS_VIEW"
+
+  # From here the manifest knows everything, so an interruption can be undone with 'back'.
+  write_active pr "$1" sha "$PR_REV" title "$TITLE_NOW" base "$PR_BASE" risk "$RISK_LEVEL" \
+    started "$(date -Is)" phase linking snapshot "$SNAPSHOT" prev_link "" mode system
+
+  note "writing the PR's files into the system"
+  for dest in "${dirs[@]}"; do
+    [[ -n "$dest" ]] || continue
+    priv install -d -m 755 "$SYSROOT$dest" || { warn "could not create $dest"; sys_apply_failed; return 1; }
+  done
+  for i in "${!PLAN_DEST[@]}"; do
+    if [[ "${PLAN_KIND[i]}" == R ]]; then
+      priv rm -f -- "$SYSROOT${PLAN_DEST[i]}" || { warn "could not remove ${PLAN_DEST[i]}"; sys_apply_failed; return 1; }
+    else
+      write_blob "${PLAN_BLOB[i]}" "${PLAN_MODE[i]}" "$SYSROOT${PLAN_DEST[i]}" priv \
+        || { warn "could not write ${PLAN_DEST[i]}"; sys_apply_failed; return 1; }
+    fi
+  done
+  for i in "${!USER_REL[@]}"; do
+    mkdir -p "$(dirname "$HOME/${USER_REL[i]}")"
+    write_blob "${USER_BLOB[i]}" "${USER_MODE[i]}" "$HOME/${USER_REL[i]}" \
+      || { warn "could not write ~/${USER_REL[i]}"; sys_apply_failed; return 1; }
+  done
+}
+
+sys_apply_failed() {
+  warn "putting back what was already replaced"
+  if sys_restore; then
+    rm -f "$ACTIVE" "$SYS_VIEW"
+  else
+    warn "I could not put everything back. Run 'omarchy-pr-try back'."
+  fi
+}
+
+# Put the originals back. Only a file that still holds exactly what we installed
+# is touched: if a package update replaced it since, the newer file is kept.
+# Safe to run again. Returns 1 when something could not be restored.
+sys_restore() {
+  local kind dest orig new cur want rc=0 dirs=() i restore=() skipped=0 f
+  if ! priv test -f "$SYS_MANIFEST"; then
+    note "the system files were already put back"
+    return 0
+  fi
+  if priv test -f "$SYS_BACKUP"; then
+    want=$(priv sha256sum "$SYS_BACKUP" | cut -d' ' -f1)
+    [[ "$want" == "$(priv cat "$SYS_BACKUP_SUM" 2>/dev/null)" ]] \
+      || { warn "the saved system files do not match their checksum; nothing was put back"; return 1; }
+    priv tar -tzf "$SYS_BACKUP" >/dev/null || { warn "the saved system files are damaged; nothing was put back"; return 1; }
+  fi
+  local manifest
+  manifest=$(priv cat "$SYS_MANIFEST") || return 1
+
+  while IFS=$'\t' read -r kind dest orig new; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$kind" == D ]]; then dirs+=("$dest"); continue; fi
+    if ! sys_dest_ok "$dest"; then warn "the manifest has a path I will not touch ($(clean "$dest")); skipping it"; rc=1; continue; fi
+    cur=$(sys_sha "$dest")
+    case "$kind" in
+      M | R)
+        if [[ "$cur" == "$new" && "$kind" == M ]] || [[ "$cur" == '-' && "$kind" == R ]]; then
+          restore+=("${dest#/}")
+        elif [[ "$cur" == "$orig" ]]; then
+          :   # never replaced, or already restored
+        else
+          warn "$dest changed since the PR was installed (a package update?); I left it alone"
+          skipped=$((skipped + 1))
+        fi ;;
+      A)
+        if [[ "$cur" == "$new" ]]; then
+          priv rm -f -- "$SYSROOT$dest" || rc=1
+        elif [[ "$cur" != '-' ]]; then
+          warn "$dest changed since the PR was installed (a package update?); I left it alone"
+          skipped=$((skipped + 1))
+        fi ;;
+    esac
+    priv rm -f -- "$SYSROOT$dest.omarchy-pr-try.new" 2>/dev/null || true
+  done <<<"$manifest"
+
+  if (( ${#restore[@]} )); then
+    # An R entry whose file is gone, or an M entry that still holds the PR's version.
+    for f in "${restore[@]}"; do
+      priv tar -C "$SYSROOT/" -xzpf "$SYS_BACKUP" -- "$f" || { warn "could not restore /$f"; rc=1; }
+    done
+  fi
+  for (( i = ${#dirs[@]} - 1; i >= 0; i-- )); do
+    priv rmdir -- "$SYSROOT${dirs[i]}" 2>/dev/null || true
+  done
+  if (( rc == 0 )); then
+    priv rm -rf -- "$SYS_STATE"
+    rm -f "$SYS_VIEW"
+    if (( skipped )); then warn "$skipped files were left because they changed after the PR was installed"; fi
+  fi
+  return "$rc"
+}
+
+# ---- making the running session notice
+
+# Scripts need nothing: the next time one starts it is the new file. The compositor's
+# config can be reloaded, and the shell has to be restarted by something that knows how.
+reload_session() { # shell-changed hypr-changed
+  local c found=()
+  if [[ "$2" == 1 ]] && has hyprctl && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    if hyprctl reload >/dev/null 2>&1; then note "reloaded the Hyprland config"; fi
+  fi
+  if [[ "$1" == 1 ]]; then
+    while IFS= read -r c; do found+=("$c"); done < <(compgen -c omarchy-restart 2>/dev/null | LC_ALL=C sort -u)
+    echo "  the shell (Quickshell) keeps running the QML it loaded: restart it to see the change"
+    if (( ${#found[@]} )); then
+      echo "  restart commands on this system: ${found[*]}"
+    else
+      echo "  (log out and back in, or reboot)"
+    fi
+  fi
+}
+
+changed_kinds() { # sets SHELL_CHANGED and HYPR_CHANGED from the plan
+  local d r
+  SHELL_CHANGED=0; HYPR_CHANGED=0
+  for d in "${PLAN_DEST[@]}"; do
+    case "$d" in /usr/share/omarchy/shell/*) SHELL_CHANGED=1 ;; esac
+  done
+  for r in "${USER_REL[@]}"; do
+    case "$r" in .config/hypr/*) HYPR_CHANGED=1 ;; .config/quickshell/* | .config/omarchy/shell/*) SHELL_CHANGED=1 ;; esac
+  done
+}
+
+# Same as changed_kinds, but from the saved copy of the manifest (used by 'back').
+view_kinds() {
+  local kind dest
+  SHELL_CHANGED=0; HYPR_CHANGED=0
+  [[ -f "$SYS_VIEW" ]] || return 0
+  while IFS=$'\t' read -r kind dest _; do
+    case "$dest" in
+      /usr/share/omarchy/shell/* | .config/quickshell/* | .config/omarchy/shell/*) SHELL_CHANGED=1 ;;
+      .config/hypr/*) HYPR_CHANGED=1 ;;
+    esac
+  done <"$SYS_VIEW"
+}
+
+# Check the files are really there, and that nothing earlier in PATH hides them.
+# Reads the readable copy of the manifest. Returns 1 when something is wrong.
+sys_check() {
+  local kind dest orig new cur name found bad=0 n=0
+  [[ -f "$SYS_VIEW" ]] || { echo "  no record of installed files"; return 1; }
+  while IFS=$'\t' read -r kind dest orig new; do
+    [[ -n "$kind" && "$kind" != D ]] || continue
+    n=$((n + 1))
+    if [[ "$kind" == U ]]; then
+      cur=$(sha256sum "$HOME/$dest" 2>/dev/null | cut -d' ' -f1 || true)
+      if [[ "$cur" == "$new" ]]; then printf '  ✓ ~/%s   in place\n' "$dest" | sanitize
+      else printf '  ✗ ~/%s   differs from the PR (you changed it since?)\n' "$dest" | sanitize; bad=1; fi
+      continue
+    fi
+    cur=$(sys_sha "$dest")
+    case "$kind" in
+      R) if [[ "$cur" == '-' ]]; then printf '  ✓ %s   removed\n' "$dest"; else printf '  ✗ %s   still there\n' "$dest"; bad=1; fi ;;
+      *) if [[ "$cur" == "$new" ]]; then
+           printf '  ✓ %s   in place%s\n' "$dest" "$([[ "$kind" == A ]] && echo ' (new)')"
+         else
+           printf '  ✗ %s   not the PR version any more\n' "$dest"; bad=1
+         fi ;;
+    esac
+    if [[ "$dest" == /usr/bin/* ]]; then
+      name="${dest##*/}"
+      found=$(type -P "$name" 2>/dev/null || true)
+      if [[ -n "$found" && "$found" != "$SYSROOT$dest" ]]; then
+        printf '  ! your shell runs %s from %s, not from %s\n' "$name" "$found" "$dest" | sanitize
+        bad=1
+      fi
+    fi
+  done <"$SYS_VIEW"
+  (( n > 0 )) || echo "  (no files recorded)"
+  return "$bad"
+}
+
+offer_system_done() { # pr
+  local pr="$1"
+  echo
+  echo "PR #$pr is now in your system:"
+  echo "  commit   $(meta sha | cut -c1-12)  ·  $(meta title | sanitize | head -c 60)"
+  echo "  base     $(meta base | sanitize)"
+  echo
+  sys_check || true
+  echo
+  echo "  commands started from now on use the PR's files; no reboot is needed"
+  reload_session "$SHELL_CHANGED" "$HYPR_CHANGED"
+  echo
+  echo "When you are finished: omarchy-pr-try back   (puts the original files back)"
+  echo "Do not run 'omarchy update' or 'pacman -Syu' while a PR is installed: an update"
+  echo "would overwrite these files and mix versions. Go back first."
 }
 
 # ---------------------------------------------------------------- backup
@@ -897,43 +1394,9 @@ take_snapshot() { # dies if there is no snapshot and no override
 
 # ---------------------------------------------------------------- try
 
-try_pr() {
-  local pr="$1" want_sha="${2:-}" title prev
-  valid_pr "$pr"
-  [[ -z "$want_sha" || "$want_sha" =~ ^[0-9a-f]{7,40}$ ]] || die "SHA must be 7 to 40 hex characters"
-  need git
-  preflight_link
-  lock
-  if [[ -f "$ACTIVE" ]]; then
-    die "PR #$(meta pr) is already active ($(meta phase)); run 'omarchy-pr-try back' first"
-  fi
-  snapshot_precheck
-
-  note "fetching PR #$pr"
-  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
-  if [[ -n "$want_sha" && "$PR_REV" != "$want_sha"* ]]; then
-    die "PR #$pr is now at ${PR_REV:0:12}, not $want_sha. It changed; review it again."
-  fi
-  title=$(g log -1 --format=%s "$PR_REV")
-  check_reviewed "$pr" || { note "cancelled"; return 0; }
-  show_pr_header "$pr"
-  analyze
-
-  echo
-  echo "If you continue, this PR's code runs as you, and through sudo: while it is linked,"
-  echo "'sudo omarchy-*' resolves to the PR's own scripts."
-  if has omarchy-snapshot; then echo "A system snapshot is taken first; it is the way back for /etc and packages."; fi
-  if [[ "$RISK_LEVEL" == HIGH ]]; then
-    if [[ -n "${OMARCHY_PR_YES:-}" ]]; then
-      [[ -n "${OMARCHY_PR_ALLOW_HIGH:-}" ]] || die "risk is HIGH; refusing without a person at the keyboard (OMARCHY_PR_ALLOW_HIGH=1 overrides)"
-    elif [[ -z "${OMARCHY_PR_ALLOW_HIGH:-}" ]]; then
-      confirm_typed "Risk is HIGH. Only go on if you read the diff." "$pr" || { note "cancelled"; return 0; }
-    fi
-  else
-    confirm "Risk is $RISK_LEVEL. Switch this machine to PR #$pr?" || { note "cancelled"; return 0; }
-  fi
-
-  ensure_state
+# Old behaviour: point OMARCHY_PATH at the checkout with omarchy-dev-link.
+apply_link() { # pr
+  local pr="$1" prev
   g checkout --quiet --force --detach "$PR_REV"
   g clean -ffdxq
 
@@ -949,8 +1412,8 @@ try_pr() {
 
   # Write the state first, so that if anything below is interrupted
   # (a reboot prompt, Ctrl+C, a crash), 'back' knows what to undo.
-  write_active pr "$pr" sha "$PR_REV" title "$title" base "$PR_BASE" risk "$RISK_LEVEL" \
-    started "$(date -Is)" phase linking snapshot "$SNAPSHOT" prev_link "$prev"
+  write_active pr "$pr" sha "$PR_REV" title "$TITLE_NOW" base "$PR_BASE" risk "$RISK_LEVEL" \
+    started "$(date -Is)" phase linking snapshot "$SNAPSHOT" prev_link "$prev" mode link
 
   note "switching to PR #$pr (this may ask for your password)"
   if ! link_to "$CHECKOUT"; then
@@ -976,6 +1439,115 @@ try_pr() {
   echo "Do not run 'omarchy update' while a PR is linked: in dev-link mode it fast-forwards"
   echo "the linked checkout from its upstream. Go back first."
   offer_reboot
+}
+
+# New default: write the PR's files into the real system.
+apply_system() { # pr
+  local pr="$1"
+  take_snapshot
+  note "backing up your config"
+  make_backup
+  save_packages
+  changed_kinds
+  sys_apply "$pr" || die "the PR could not be installed; see above"
+  set_meta phase linked
+  offer_system_done "$pr"
+}
+
+check_mode() {
+  case "$MODE" in system | link) ;; *) die "OMARCHY_PR_MODE must be 'system' or 'link', got '$MODE'" ;; esac
+}
+
+# omarchy-pr-try try N [SHA] [--link|--system]
+cmd_try() {
+  local a pos=()
+  for a in "$@"; do
+    case "$a" in
+      --link) MODE=link ;;
+      --system) MODE=system ;;
+      -*) die "unknown option '$a'" ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+  (( ${#pos[@]} >= 1 )) || die "usage: omarchy-pr-try try N [SHA] [--link]"
+  try_pr "${pos[0]}" "${pos[1]:-}"
+}
+
+# omarchy-pr-try plan N: what try would put where. Changes nothing.
+cmd_plan() {
+  local pr="${1:-}"
+  [[ -n "$pr" ]] || die "usage: omarchy-pr-try plan N"
+  valid_pr "$pr"
+  need git
+  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
+  show_pr_header "$pr"
+  plan_build
+  plan_show "$pr"
+  echo
+  echo "This is only a plan. Nothing was changed."
+}
+
+try_pr() {
+  local pr="$1" want_sha="${2:-}"
+  valid_pr "$pr"
+  [[ -z "$want_sha" || "$want_sha" =~ ^[0-9a-f]{7,40}$ ]] || die "SHA must be 7 to 40 hex characters"
+  check_mode
+  need git
+  if [[ "$MODE" == link ]]; then preflight_link; fi
+  lock
+  if [[ -f "$ACTIVE" ]]; then
+    die "PR #$(meta pr) is already active ($(meta phase)); run 'omarchy-pr-try back' first"
+  fi
+  snapshot_precheck
+  if [[ "$MODE" == system ]]; then sys_precheck; fi
+
+  note "fetching PR #$pr"
+  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
+  if [[ -n "$want_sha" && "$PR_REV" != "$want_sha"* ]]; then
+    die "PR #$pr is now at ${PR_REV:0:12}, not $want_sha. It changed; review it again."
+  fi
+  TITLE_NOW=$(g log -1 --format=%s "$PR_REV")
+  check_reviewed "$pr" || { note "cancelled"; return 0; }
+  show_pr_header "$pr"
+  analyze
+
+  if [[ "$MODE" == system ]]; then
+    plan_build
+    plan_show "$pr"
+    if plan_empty; then
+      die "nothing in this PR can be put into the system directly, so there is nothing to try."$'\n'"  (--link would still point Omarchy at the PR's checkout.)"
+    fi
+  fi
+
+  echo
+  if [[ "$MODE" == system ]]; then
+    echo "If you continue, the files above are written into your system with sudo. They run"
+    echo "as you, and the commands among them also as root (sudo omarchy-* uses /usr/bin)."
+    echo "The files they replace are saved first, and 'back' puts them back."
+  else
+    echo "If you continue, this PR's code runs as you, and through sudo: while it is linked,"
+    echo "'sudo omarchy-*' resolves to the PR's own scripts."
+  fi
+  if has omarchy-snapshot; then echo "A system snapshot is taken first; it is the way back for /etc and packages."; fi
+  if [[ "$RISK_LEVEL" == HIGH ]]; then
+    if [[ -n "${OMARCHY_PR_YES:-}" ]]; then
+      [[ -n "${OMARCHY_PR_ALLOW_HIGH:-}" ]] || die "risk is HIGH; refusing without a person at the keyboard (OMARCHY_PR_ALLOW_HIGH=1 overrides)"
+    elif [[ -z "${OMARCHY_PR_ALLOW_HIGH:-}" ]]; then
+      confirm_typed "Risk is HIGH. Only go on if you read the diff." "$pr" || { note "cancelled"; return 0; }
+    fi
+  elif [[ "$MODE" == system ]]; then
+    confirm "Risk is $RISK_LEVEL. Install PR #$pr's files into this system?" || { note "cancelled"; return 0; }
+  else
+    confirm "Risk is $RISK_LEVEL. Switch this machine to PR #$pr?" || { note "cancelled"; return 0; }
+  fi
+
+  ensure_state
+  if [[ "$MODE" == system ]]; then
+    sys_auth
+    apply_system "$pr"
+  else
+    apply_link "$pr"
+  fi
 }
 
 # ---------------------------------------------------------------- back
@@ -1007,10 +1579,14 @@ write_history() { # started pr sha title verdict note comment_url risk
 }
 
 # What going back does NOT undo, and what changed in the package set.
-report_leftovers() { # snapshot-status
+report_leftovers() { # snapshot-status mode
   local after diff added removed changed
   echo
-  echo "Not undone: files outside your config folders (for example in /etc), and packages."
+  if [[ "${2:-link}" == system ]]; then
+    echo "Put back: the system files this tool replaced. Not undone: anything else outside your config folders (for example in /etc), and packages."
+  else
+    echo "Not undone: files outside your config folders (for example in /etc), and packages."
+  fi
   if [[ "$1" == ok ]]; then
     echo "A system snapshot was taken when you started. If the PR changed system files,"
     echo "restore it (pick it in the Limine boot menu, or run omarchy-snapshot restore)."
@@ -1111,10 +1687,11 @@ restore_paths() { # stage displaced-dir
 back() {
   [[ -f "$ACTIVE" ]] || die "no PR is active"
   lock
-  local pr sha title started phase prev risk snap stage disp want
+  local pr sha title started phase prev risk snap stage disp want bmode
   pr=$(meta pr); sha=$(meta sha); title=$(meta title); started=$(meta started)
   phase=$(meta phase); phase=${phase:-linked}
   prev=$(meta prev_link); risk=$(meta risk); snap=$(meta snapshot)
+  bmode=$(meta mode); bmode=${bmode:-link}   # state files from before system mode are dev-links
 
   if [[ "$phase" != restored ]]; then
     [[ -f "$BACKUP" && -f "$PATHS_FILE" && -f "$BACKUP_SUM" ]] || die "the backup is missing; nothing was changed"
@@ -1128,17 +1705,24 @@ back() {
     tar -C "$stage" -xzpf "$BACKUP" || die "could not unpack the backup; nothing was changed"
     check_restore_plan "$stage"
 
-    if link_is_ours; then
-      note "returning Omarchy to its normal files"
-      need omarchy-dev-unlink
-      unlink_now || die "omarchy-dev-unlink failed; your config was not touched. Fix that, then run 'back' again."
-      if link_is_ours; then die "the link to the PR code is still in place; your config was not touched. Run 'back' again."; fi
+    if [[ "$bmode" == system ]]; then
+      note "putting the original system files back (this may ask for your password)"
+      sys_auth
+      view_kinds
+      sys_restore || die "could not put all the system files back; your config was not touched. Run 'back' again."
     else
-      note "the dev-link is already gone"
-    fi
-    if [[ -n "$prev" && -d "$prev" && "$(current_link_path)" != "$prev" ]]; then
-      note "putting your earlier dev-link back: $prev"
-      link_to "$prev" || warn "could not relink; run: omarchy-dev-link '$prev'"
+      if link_is_ours; then
+        note "returning Omarchy to its normal files"
+        need omarchy-dev-unlink
+        unlink_now || die "omarchy-dev-unlink failed; your config was not touched. Fix that, then run 'back' again."
+        if link_is_ours; then die "the link to the PR code is still in place; your config was not touched. Run 'back' again."; fi
+      else
+        note "the dev-link is already gone"
+      fi
+      if [[ -n "$prev" && -d "$prev" && "$(current_link_path)" != "$prev" ]]; then
+        note "putting your earlier dev-link back: $prev"
+        link_to "$prev" || warn "could not relink; run: omarchy-dev-link '$prev'"
+      fi
     fi
 
     note "restoring your config"
@@ -1152,7 +1736,7 @@ back() {
     set_meta phase restored
   fi
 
-  report_leftovers "$snap"
+  report_leftovers "$snap" "$bmode"
   ask_verdict "$pr"
   COMMENT_URL=""
   if [[ "$VERDICT" == problems || "$VERDICT" == good ]] && is_interactive; then
@@ -1167,13 +1751,22 @@ back() {
   write_history "$started" "$pr" "$sha" "$title" "$VERDICT" "$NOTE_TEXT" "$COMMENT_URL" "$risk"
   rm -f "$ACTIVE"
   echo
-  echo "Done. Your config is restored and the dev-link is gone."
+  if [[ "$bmode" == system ]]; then
+    echo "Done. The original system files and your config are back."
+  else
+    echo "Done. Your config is restored and the dev-link is gone."
+  fi
   if [[ -d "$CHECKOUT/.git" ]]; then
     echo "The downloaded PR code is still in $WORK at commit $(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null | cut -c1-12);"
     echo "run 'omarchy-pr-try clean' to remove it."
   fi
-  echo "Reboot to finish going back (the running session still has the PR's code loaded)."
-  offer_reboot
+  if [[ "$bmode" == system ]]; then
+    reload_session "$SHELL_CHANGED" "$HYPR_CHANGED"
+    echo "No reboot is needed."
+  else
+    echo "Reboot to finish going back (the running session still has the PR's code loaded)."
+    reboot_prompt "Reboot now?"
+  fi
 }
 
 # ---------------------------------------------------------------- clean
@@ -1353,18 +1946,30 @@ cmd_comment() {
 # ---------------------------------------------------------------- status / history / doctor / install
 
 cmd_verify() {
-  local cur_link head
+  local cur_link head vmode rc=0
   echo "omarchy-pr-try $VERSION — active-PR verification"
   echo
+  vmode=$(meta mode); vmode=${vmode:-link}
   if [[ -f "$ACTIVE" ]]; then
     echo "A PR is currently active:"
     echo "  PR #$(meta pr | sanitize) · $(meta title | sanitize)"
     echo "  commit $(meta sha | cut -c1-12) · base $(meta base | sanitize) · risk $(meta risk | sanitize)"
-    echo "  status: $(meta phase | sanitize)"
+    echo "  status: $(meta phase | sanitize) · mode: $vmode"
   else
     echo "No PR is active. You are running the normal Omarchy code."
   fi
   echo
+  if [[ -f "$ACTIVE" && "$vmode" == system ]]; then
+    echo "Files the PR put into the system:"
+    sys_check || rc=1
+    echo
+    if (( rc )); then
+      echo "Something above is not as it should be. 'omarchy-pr-try back' puts the originals back."
+    else
+      echo "All of the PR's files are in place and nothing hides them."
+    fi
+    return 0
+  fi
   cur_link=$(current_link_path)
   if [[ -n "$cur_link" ]]; then
     echo "Dev-link: /etc/omarchy.conf sets OMARCHY_PATH=\"$cur_link\""
@@ -1374,16 +1979,14 @@ cmd_verify() {
         head=$(git -C "$cur_link" rev-parse HEAD 2>/dev/null | cut -c1-12)
         echo "  ✓ checkout is at $head ($(git -C "$cur_link" rev-parse --abbrev-ref HEAD 2>/dev/null))"
       fi
+      echo "  ! this only reaches programs started after it was set; a session that was already"
+      echo "    running keeps the old files until you reboot. 'back', then 'try' (system mode) avoids that."
     else
       echo "  ! points elsewhere: '$cur_link'"
     fi
   else
     echo "Dev-link: none (no OMARCHY_PATH override — running normal Omarchy)"
   fi
-  echo
-  echo "In a fresh shell, verify the PR's code is in use:"
-  echo "  command -v omarchy-dock"
-  echo "→ $(command -v omarchy-dock 2>/dev/null || echo "  not available")"
 }
 
 cmd_status() {
@@ -1396,7 +1999,9 @@ cmd_status() {
       restored) echo "  your config is restored; run 'back' to finish (rating, history)" ;;
       linking) echo "  the switch did not finish; run 'back' to undo it" ;;
     esac
-    if [[ "$phase" != restored ]] && ! link_is_ours; then
+    if [[ "$(meta mode)" == system ]]; then
+      echo "  mode: system files (see 'omarchy-pr-try verify' for each file)"
+    elif [[ "$phase" != restored ]] && ! link_is_ours; then
       echo "  ! the dev-link is not in place; run 'back' to clean up"
     fi
   else
@@ -1448,6 +2053,12 @@ cmd_doctor() {
   else
     bad snapshot "omarchy-snapshot is missing (Omarchy snapshots need the Limine bootloader), so every try will be refused (OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 overrides)"
   fi
+  if [[ -d "$SYSROOT/usr/share/omarchy" ]] && compgen -G "$SYSROOT/usr/bin/omarchy-*" >/dev/null; then
+    good system "packaged Omarchy found (/usr/share/omarchy, /usr/bin/omarchy-*): 'try' installs the PR's files there"
+  else
+    bad system "no /usr/share/omarchy or /usr/bin/omarchy-*: 'try' needs --link on this machine"
+  fi
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]] || has "$SUDO"; then good sudo "found (needed to write to /usr)"; else bad sudo "missing (needed to write to /usr)"; fi
   if has pacman; then good pacman "found (package changes are reported)"; else bad pacman "missing (package changes are not reported)"; fi
   if has flock; then good flock found; else bad flock "missing (no protection against two runs at once)"; fi
   if has shellcheck; then good shellcheck found; else echo "  • shellcheck: missing (optional)"; fi
@@ -1535,9 +2146,24 @@ ui_status() {
 
 # Used by the spinner: writes the open PRs as TSV (empty fields become "-",
 # because bash's read would squash empty tab-separated fields). Errors land in
-# the same file so the menu can show them.
+# the same file so the menu can show them. The list is cached in the state
+# folder for OMARCHY_PR_CACHE_TTL seconds (default 300, 0 = never cache), so
+# reopening the menu is instant instead of re-fetching every PR.
 cmd_pr_tsv() { # file
+  local cache="$STATE/list-cache.tsv" ttl="${OMARCHY_PR_CACHE_TTL:-300}" age=999999
+  ensure_state
+  if (( ttl > 0 )) && [[ -s "$cache" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+  fi
+  if (( age < ttl )); then
+    cp -f "$cache" "$1" 2>/dev/null && return 0
+  fi
   { list_tsv | sanitize | awk -F'\t' 'BEGIN { OFS = "\t" } { for (i = 1; i <= 7; i++) if ($i == "") $i = "-"; print }'; } >"$1" 2>&1
+  # Cache only real results (first field a PR number), never error text.
+  if (( ttl > 0 )) && [[ -s "$1" ]] \
+    && awk -F'\t' '$1 ~ /^[0-9]+$/ { f = 1 } END { exit f ? 0 : 1 }' "$1"; then
+    cp -f "$1" "$cache" 2>/dev/null || true
+  fi
 }
 
 declare -A PRINFO=()   # PR number -> title, author, draft, size, checks, base (tab separated)
@@ -1655,7 +2281,8 @@ pr_menu() {
     act=$(gum choose --header "What do you want to do?" \
       "Risk summary         scan the changes for risky patterns" \
       "Run checks           syntax checks, plus the repo's tests in a sandbox" \
-      "Try this PR          take a snapshot, then switch this machine to it" \
+      "Plan                 show which system files this PR would replace" \
+      "Try this PR          take a snapshot, then put its files into the system" \
       "Comment: it works    post a 'tested, works for me' note" \
       "Comment: problem     tell the author what went wrong" \
       "Open on GitHub" \
@@ -1663,6 +2290,7 @@ pr_menu() {
     case "$act" in
       "Risk summary"*)     risk_view "$pr" || true; pause ;;
       "Run checks"*)       "$SELF" test "$pr" || true; pause ;;
+      "Plan"*)             "$SELF" plan "$pr" || true; pause ;;
       "Comment: it works"*) "$SELF" comment "$pr" "" good || true; pause ;;
       "Comment: problem"*) "$SELF" comment "$pr" || true; pause ;;
       "Try this PR"*)
@@ -1689,7 +2317,7 @@ tui() {
      && [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
     warn "omarchy-pr-try is being run from $SELF; consider 'omarchy-pr-try install' so it is in your PATH"
   fi
-  local choice pr
+  local choice pr q results
   while true; do
     ui_clear
     ui_banner
@@ -1697,12 +2325,14 @@ tui() {
     if [[ -f "$ACTIVE" ]]; then
       choice=$(gum choose --header "What next?" \
         "Go back to normal    undo the switch and restore your config" \
+        "Verify active PR     check its files are in place" \
         "History              PRs you have tried" \
         "Doctor               check that everything this tool needs is there" \
         "Quit") || return 0
     else
       choice=$(gum choose --header "What next?" \
         "Browse open PRs      pick one, scan it, test it, try it" \
+        "Search ALL PRs       find any PR by words — open, closed, merged" \
         "Try a PR number" \
         "History              PRs you have tried" \
         "Doctor               check that everything this tool needs is there" \
@@ -1713,6 +2343,21 @@ tui() {
       "Go back to normal"*) "$SELF" back || true; pause ;;
       "Browse open PRs"*)
         if pick_pr; then pr_menu "$PICKED"; fi
+        ;;
+      "Search ALL PRs"*)
+        q=$(gum input --placeholder "Words from the title, body or comments… (author:name, label:bug work too)" --prompt "/ ") || continue
+        [[ -n "${q//[[:space:]]/}" ]] || continue
+        results=$(mktemp)
+        CLEANUP_FILES+=("$results")
+        "$SELF" search "$q" >"$results" 2>&1
+        if grep -q '^error:' "$results"; then sed 's/^/  /' "$results" >&2; pause; continue; fi
+        local found
+        found=$(grep -c '^#[0-9]' "$results" || true)
+        if (( found == 0 )); then echo "  no PRs matched '$q'"; pause; continue; fi
+        echo "  $found PRs match '$q' (open, closed and merged)"
+        choice=$(gum filter --placeholder "Filter the results… (Enter picks, Esc cancels)" <"$results") || continue
+        pr=$(sed -E 's/^#([0-9]+).*/\1/' <<<"$choice")
+        [[ "$pr" =~ ^[0-9]+$ ]] && pr_menu "$pr"
         ;;
       "Try a PR number"*)
         pr=$(gum input --placeholder "PR number" --prompt "# ") || continue
@@ -1737,9 +2382,11 @@ case "${1:-}" in
   "")            tui ;;
   __pr-tsv)      cmd_pr_tsv "${2:?}" ;;
   list)          cmd_list ;;
+  search)        shift; cmd_search "$@" ;;
   risk)          want_pr "$@"; cmd_risk "$2" ;;
   test)          want_pr "$@"; cmd_test "$2" ;;
-  try)           want_pr "$@"; try_pr "$2" "${3:-}" ;;
+  try)           want_pr "$@"; shift; cmd_try "$@" ;;
+  plan)          want_pr "$@"; cmd_plan "$2" ;;
   comment)       want_pr "$@"; cmd_comment "$2" "${3:-}" "${4:-}" ;;
   clean)         cmd_clean ;;
   back)          back ;;
@@ -1750,6 +2397,6 @@ case "${1:-}" in
   install)       cmd_install ;;
   version|--version) echo "omarchy-pr-try $VERSION" ;;
   -h|--help|help) usage ;;
-  [0-9]*)        try_pr "$1" "${2:-}" ;;
+  [0-9]*)        cmd_try "$@" ;;
   *)             usage; exit 1 ;;
 esac

@@ -1,11 +1,23 @@
 {
-  "version": "0.3.2",
+  "version": "0.4.0",
   "name": "omarchy-pr-try",
   "description": "Test Omarchy PRs safely on your own machine",
   "license": "MIT",
   "author": "itscallssh",
   "source": "https://github.com/itscallssh/omarchy-pr-try",
   "changelog": [
+    {
+      "version": "0.4.0",
+      "date": "2026-11-09",
+      "changes": [
+        "try installs the PR's changed files into the real system (/usr/bin, /usr/share/omarchy, ~/.config) so the running session uses them at once",
+        "Originals saved in a root-owned folder with checksums; back restores them and leaves files a package update replaced",
+        "New plan command; verify checks each file and PATH shadowing",
+        "Failed or interrupted installs are rolled back",
+        "--link keeps the old dev-link behaviour",
+        "Fixed an empty PR banner printed by back after a dev-link"
+      ]
+    },
     {
       "version": "0.3.2",
       "date": "2026-11-09",

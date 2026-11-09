@@ -1,4 +1,43 @@
-# Fixes and improvements to `omarchy-pr-try` (v0.3.2 → v0.3.2+)
+# Fixes in v0.4.0: the PR now goes into the real system
+
+## What was wrong
+
+`try N` downloaded the PR into `~/.cache/omarchy-pr-try/checkout` (a hidden folder) and called
+`omarchy-dev-link`, which only writes `OMARCHY_PATH` into `/etc/omarchy.conf`. On Omarchy 4,
+which is a package (`/usr/bin/omarchy-*`, `/usr/share/omarchy`), that variable is read when a
+program **starts**. The already-running Hyprland / Quickshell / bar session, and keybindings
+started from it, kept running the packaged files, so the PR looked "not set", and it was not
+obvious where the PR even was. `verify` also asked the shell it ran in, which has the same
+problem, and it checked a command (`omarchy-dock`) that is specific to one PR.
+
+## What changed
+
+1. `try` now writes the PR's **changed files** into the system: `bin/omarchy*` to `/usr/bin`,
+   `themes/` and `shell/` to `/usr/share/omarchy`, `config/` to `~/.config`. Everything started
+   afterwards uses them; no reboot.
+2. Safe by construction: originals are saved first in `/var/lib/omarchy-pr-try` (root-owned),
+   a manifest records the checksum of every installed file, files are replaced atomically,
+   symlinks/odd names/`/etc` are never written, and a failure rolls everything back.
+3. `back` restores the originals. A file that changed since (a package update) is left alone.
+4. `plan N` shows the exact mapping and what is not applied (install/, migrations/, etc/,
+   default/, applications/) before anything happens.
+5. `verify` checks each file's checksum and warns if another copy earlier in `PATH` hides it.
+6. `--link` / `OMARCHY_PR_MODE=link` keep the old behaviour; old state files still `back` correctly.
+7. Fixed: `back` after a dev-link printed an empty "PR # is now active" banner.
+
+## Limits (honest)
+
+- The mapping comes from how Omarchy 4 is packaged (third-party documentation), and this was
+  tested against a stand-in tree and fake commands, not on a real install. Run `plan N` and try
+  it on a spare machine or VM first. If a path is wrong it is one small function: `map_path`.
+- The Quickshell UI has to be restarted to show QML changes; the tool cannot know the restart
+  command, so it lists the `omarchy-restart-*` commands it finds.
+- Things owned by the `omarchy-settings` package (etc/, default/, applications/) are listed as
+  "not applied": testing those needs a package rebuild.
+
+---
+
+# Earlier fixes (v0.3.2)
 
 ## What was wrong
 
