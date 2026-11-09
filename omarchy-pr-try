@@ -1,0 +1,1755 @@
+#!/usr/bin/env bash
+# omarchy-pr-try — browse open Omarchy PRs, check them for risk, try one on
+# your own machine, and go back.
+#
+#   omarchy-pr-try              menu: browse PRs, then risk / checks / try
+#   omarchy-pr-try list         print open PRs
+#   omarchy-pr-try risk N       risk summary for PR N (remembers the commit you reviewed)
+#   omarchy-pr-try test N       run checks on PR N (syntax, plus the repo's tests in a sandbox)
+#   omarchy-pr-try try N [SHA]  switch this machine to PR N (SHA pins the exact commit)
+#   omarchy-pr-try back         undo, then log how it went
+#   omarchy-pr-try status       show which PR is active
+#   omarchy-pr-try history      PRs you have tried
+#   omarchy-pr-try comment N [text] [good]   comment to the PR's author
+#                               ('good' = a "tested, works for me" note)
+#   omarchy-pr-try clean        delete the downloaded PR code and saved copies
+#   omarchy-pr-try doctor       check that everything this tool needs is there
+#   omarchy-pr-try verify       check which PR is active and whether it is really
+#                               being used by new shell sessions
+#   omarchy-pr-try install      add a launcher entry and show a keybinding
+#
+# Needs Omarchy 4 (Quattro): it switches with omarchy-dev-link / omarchy-dev-unlink.
+# DRAFT: tested against a fake repo with stand-in commands, not on a real Omarchy install.
+# Read it first, and try it on a spare machine or VM.
+#
+# Environment (all optional):
+#   OMARCHY_PR_REPO, OMARCHY_PR_REMOTE   which repo to use (default omacom/omarchy)
+#   OMARCHY_PR_DIR, OMARCHY_PR_STATE     where downloads and state live
+#   OMARCHY_PR_YES=1                     answer "yes" to ordinary prompts (never to
+#                                        comments, reboots, or the safety stops below)
+#   OMARCHY_PR_ALLOW_HIGH=1              let a HIGH-risk PR through without typing its number
+#   OMARCHY_PR_ALLOW_NO_SNAPSHOT=1       try a PR even though no system snapshot can be taken.
+#                                        Without this, a snapshot is required for every PR.
+#   OMARCHY_PR_BACKUP_EXTRA="a b"        more paths (relative to $HOME) to back up
+#   OMARCHY_PR_BACKUP_MAX_MB=500         refuse to back up more than this
+#   OMARCHY_PR_TEST_NET=1                allow network inside the test sandbox (the repo's tests do not need it)
+#   OMARCHY_PR_UNSAFE_TEST=1             allow running repo tests without a sandbox (asks first)
+set -euo pipefail
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "error: bash 4.4 or newer is required" >&2
+  exit 1
+fi
+
+VERSION="0.3.2"
+
+REPO="${OMARCHY_PR_REPO:-omacom/omarchy}"
+REMOTE="${OMARCHY_PR_REMOTE:-https://github.com/$REPO.git}"
+WORK="${OMARCHY_PR_DIR:-$HOME/.cache/omarchy-pr-try}"
+STATE="${OMARCHY_PR_STATE:-$HOME/.local/state/omarchy-pr-try}"
+CHECKOUT="$WORK/checkout"
+BACKUP="$STATE/backup.tar.gz"
+BACKUP_SUM="$STATE/backup.sha256"
+PATHS_FILE="$STATE/backup.paths"    # paths that existed when you started (restored on back)
+ABSENT_FILE="$STATE/backup.absent"  # paths that did not exist (removed on back)
+PKGS_BEFORE="$STATE/packages.before"
+ACTIVE="$STATE/active"
+HISTORY="$STATE/history.tsv"
+REVIEWED_DIR="$STATE/reviewed"
+DISPLACED_DIR="$STATE/displaced"
+OMARCHY_CONF="${OMARCHY_PR_CONF:-/etc/omarchy.conf}"
+BACKUP_MAX_MB="${OMARCHY_PR_BACKUP_MAX_MB:-500}"
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# Always backed up and restored (relative to $HOME). Paths that the PR's own
+# config/ changes touch are added automatically, see derive_backup_paths.
+BACKUP_PATHS=(.config/omarchy .config/hypr .local/state/omarchy)
+
+# Risk rules, one per line: LEVEL~label~regex[~files] (matched against added lines).
+# The optional last field limits the rule to file names matching that regex.
+# Do not use ~ inside a regex.
+RULES=(
+  'HIGH~runs commands as root (sudo / pkexec)~(^|[^[:alnum:]_-])(sudo|pkexec|doas)([[:space:]]|$)'
+  'HIGH~pipes a download into a shell~(curl|wget)[^|]*[|][[:space:]]*(sudo[[:space:]]+)?(ba|z)?sh'
+  'HIGH~runs downloaded code through process substitution~((ba|z)?sh|source|[.])[[:space:]]+<[(][[:space:]]*(curl|wget)'
+  'HIGH~decodes a hidden payload and runs it~base64[^|]*(-d|--decode)[^|]*[|][[:space:]]*(sudo[[:space:]]+)?(ba|z)?sh|eval[^;]*base64'
+  'HIGH~evaluates dynamic code~(^|[^[:alnum:]_])eval[[:space:]]'
+  'HIGH~touches sudoers or polkit~sudoers|polkit'
+  'HIGH~opens a raw network socket~/dev/(tcp|udp)/'
+  'HIGH~touches SSH or GPG keys or saved logins~[.]ssh/|[.]gnupg|id_(rsa|ed25519|ecdsa)|Login Data|logins[.]json|[.]password-store'
+  'MEDIUM~touches system files in /etc~/etc/'
+  'MEDIUM~installs or removes packages~(pacman|yay|paru)[[:space:]]+-[A-Za-z]*[SRU]|omarchy-pkg-(add|drop)'
+  'MEDIUM~downloads from the internet~(^|[^[:alnum:]_])(curl|wget)[[:space:]]|git clone'
+  'MEDIUM~changes services or the boot setup~systemctl|limine|mkinitcpio|/boot/'
+  'MEDIUM~starts programs automatically~exec-once|ExecStart=|autostart'
+  'MEDIUM~touches shell startup files~[.](bashrc|bash_profile|profile|zshrc)|uwsm/env'
+  'MEDIUM~runs commands from Lua~os[.]execute|io[.]popen'
+  'MEDIUM~decodes base64~base64[[:space:]]+(-d|--decode)'
+  'MEDIUM~uses netcat or socat~(^|[^[:alnum:]_-])(nc|ncat|socat)[[:space:]]'
+  'MEDIUM~deletes recursively~rm[[:space:]]+-[A-Za-z]*r'
+  'LOW~changes permissions or ownership~(^|[^[:alnum:]_-])(chmod|chown)[[:space:]]'
+  # Shell plugins (QML/JS) run inside Omarchy's own unsandboxed shell process.
+  'MEDIUM~starts programs from a QML or JS file~(^|[^[:alnum:]_])Process[[:space:]]*[{]|(^|[^[:alnum:]_])(Quickshell[.])?execDetached[[:space:]]*[(]|Quickshell[.]exec[[:space:]]*[(]~[.](qml|js|mjs)$'
+  'MEDIUM~builds a shell command from a string (check for untrusted input)~(^|[^[:alnum:]_/-])(ba|z)?sh[^[:alnum:]]+-[a-z]?c([^[:alnum:]_]|$)~[.](qml|js|mjs)$'
+  'MEDIUM~network access from a plugin~XMLHttpRequest|(^|[^[:alnum:]_.])fetch[[:space:]]*[(]|WebSocket[[:space:]]*[{]~[.](qml|js|mjs)$'
+  'LOW~opens a link outside the shell~Qt[.]openUrlExternally~[.](qml|js|mjs)$'
+)
+
+# ---------------------------------------------------------------- basics
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "! $*" >&2; }
+note() { echo "→ $*"; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+need() { has "$1" || die "$1 is required but not installed"; }
+
+# Strip control characters (terminal escape sequences included) so text that a
+# PR author controls cannot move the cursor, recolor, or hide a warning.
+sanitize() { LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g'; }
+# One line, no control characters. For values that go into state files.
+clean() { printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | sanitize; }
+
+# ---------------------------------------------------------------- look and feel
+# Cosmetic only. NO_COLOR turns colors off. Escape codes only appear on a real
+# terminal (or with OMARCHY_PR_FORCE_COLOR=1), so piped output stays plain.
+C_ACCENT="${OMARCHY_PR_ACCENT:-75}"
+
+# Decided once, here, in the main shell. Inside $( ) stdout is never a terminal,
+# so asking again later would wrongly turn colors off.
+COLOR_ON=""
+if [[ -z "${NO_COLOR:-}" && ( -n "${OMARCHY_PR_FORCE_COLOR:-}" || -t 1 ) ]]; then COLOR_ON=1; fi
+use_color() { [[ -n "$COLOR_ON" ]]; }
+
+paint() { # sgr text
+  if use_color; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi
+}
+
+badge() { # LEVEL
+  local sgr
+  case "$1" in HIGH) sgr='1;97;41' ;; MEDIUM) sgr='1;30;43' ;; LOW) sgr='1;30;42' ;; *) sgr='2' ;; esac
+  if use_color; then printf '\033[%sm %s \033[0m' "$sgr" "$1"; else printf '[%s]' "$1"; fi
+}
+
+# Colors report text by pattern. It runs after sanitize, so only our own codes get in.
+colorize() {
+  if ! use_color; then cat; return; fi
+  local e=$'\033' r=$'\033[0m' t=$'\t'
+  LC_ALL=C sed -E \
+    -e "s/^(Risk: )HIGH\$/\1${e}[1;97;41m HIGH ${r}/" \
+    -e "s/^(Risk: )MEDIUM\$/\1${e}[1;30;43m MEDIUM ${r}/" \
+    -e "s/^(Risk: )LOW\$/\1${e}[1;30;42m LOW ${r}/" \
+    -e "s/^  \[HIGH\]/  ${e}[1;31m[HIGH]${r}/" \
+    -e "s/^  \[MEDIUM\]/  ${e}[1;33m[MEDIUM]${r}/" \
+    -e "s/^  \[LOW\]/  ${e}[1;36m[LOW]${r}/" \
+    -e "s/^(PR #[0-9]+: .*)\$/${e}[1m\1${r}/" \
+    -e "s/^(PR #[0-9]+ is active.*)\$/${e}[1m\1${r}/" \
+    -e "s/^(omarchy-pr-try [0-9.]+)\$/${e}[1m\1${r}/" \
+    -e "s/^(  commit .*)\$/${e}[2m\1${r}/" \
+    -e "s|^(  https://.*)\$|${e}[2;4m\1${r}|" \
+    -e "s/^(WARNING: .*)\$/${e}[1;31m\1${r}/" \
+    -e "s/^(  )(!.*)\$/\1${e}[33m\2${r}/" \
+    -e "s/^(  )✓/\1${e}[32m✓${r}/" \
+    -e "s/^(  )(✗.*)\$/\1${e}[31m\2${r}/" \
+    -e "s/^(Checks passed\.)\$/${e}[1;32m\1${r}/" \
+    -e "s/^(Syntax checks passed\..*)\$/${e}[32m\1${r}/" \
+    -e "s/^(Some checks failed\.)\$/${e}[1;31m\1${r}/" \
+    -e "s/^(All good\.)\$/${e}[1;32m\1${r}/" \
+    -e "s/^(Fix the .*)\$/${e}[1;31m\1${r}/" \
+    -e "s/^(Changed files:)\$/${e}[1m\1${r}/" \
+    -e "s/^(This is a pattern scan.*)\$/${e}[2m\1${r}/" \
+    -e "s/^(  )A${t}/\1${e}[32mA${r}${t}/" \
+    -e "s/^(  )D${t}/\1${e}[31mD${r}${t}/" \
+    -e "s/^(  )M${t}/\1${e}[33mM${r}${t}/" \
+    -e "s/^(no PR is active)\$/${e}[2m\1${r}/" \
+    -e "s/^(  • .*)\$/${e}[2m\1${r}/"
+}
+
+say() { printf '%s\n' "$*" | colorize; }
+
+# Theme gum through its own environment variables. Versions that do not know a
+# variable ignore it, and anything you already set is left alone.
+theme_gum() {
+  has gum || return 0
+  use_color || return 0
+  export GUM_CHOOSE_CURSOR="${GUM_CHOOSE_CURSOR:-▸ }"
+  export GUM_CHOOSE_CURSOR_FOREGROUND="${GUM_CHOOSE_CURSOR_FOREGROUND:-$C_ACCENT}"
+  export GUM_CHOOSE_SELECTED_FOREGROUND="${GUM_CHOOSE_SELECTED_FOREGROUND:-$C_ACCENT}"
+  export GUM_CHOOSE_HEADER_FOREGROUND="${GUM_CHOOSE_HEADER_FOREGROUND:-244}"
+  export GUM_FILTER_INDICATOR="${GUM_FILTER_INDICATOR:-▸}"
+  export GUM_FILTER_INDICATOR_FOREGROUND="${GUM_FILTER_INDICATOR_FOREGROUND:-$C_ACCENT}"
+  export GUM_FILTER_MATCH_FOREGROUND="${GUM_FILTER_MATCH_FOREGROUND:-$C_ACCENT}"
+  export GUM_FILTER_PROMPT="${GUM_FILTER_PROMPT:-› }"
+  export GUM_FILTER_PROMPT_FOREGROUND="${GUM_FILTER_PROMPT_FOREGROUND:-$C_ACCENT}"
+  export GUM_FILTER_HEADER_FOREGROUND="${GUM_FILTER_HEADER_FOREGROUND:-244}"
+  export GUM_CONFIRM_PROMPT_FOREGROUND="${GUM_CONFIRM_PROMPT_FOREGROUND:-$C_ACCENT}"
+  export GUM_CONFIRM_SELECTED_BACKGROUND="${GUM_CONFIRM_SELECTED_BACKGROUND:-$C_ACCENT}"
+  export GUM_CONFIRM_SELECTED_FOREGROUND="${GUM_CONFIRM_SELECTED_FOREGROUND:-16}"
+  export GUM_SPIN_SPINNER_FOREGROUND="${GUM_SPIN_SPINNER_FOREGROUND:-$C_ACCENT}"
+  export GUM_INPUT_PROMPT_FOREGROUND="${GUM_INPUT_PROMPT_FOREGROUND:-$C_ACCENT}"
+  export GUM_INPUT_CURSOR_FOREGROUND="${GUM_INPUT_CURSOR_FOREGROUND:-$C_ACCENT}"
+  export GUM_TABLE_BORDER_FOREGROUND="${GUM_TABLE_BORDER_FOREGROUND:-244}"
+  export GUM_TABLE_HEADER_FOREGROUND="${GUM_TABLE_HEADER_FOREGROUND:-$C_ACCENT}"
+}
+
+pause() {
+  printf '\n  %s ' "$(paint 2 '↵  press Enter to continue')" >&2
+  read -r _ || true
+}
+
+valid_pr() { [[ "$1" =~ ^[0-9]+$ ]] || die "PR number must be a number, got '$1'"; }
+
+# A path relative to $HOME that is safe to back up, restore, or remove.
+valid_rel() {
+  local p="$1" re='^[A-Za-z0-9._@+,= -]+(/[A-Za-z0-9._@+,= -]+)*$'
+  [[ -n "$p" && "$p" =~ $re ]] || return 1
+  case "/$p/" in */../* | */./*) return 1 ;; esac
+  case "$p" in .config | .local | .local/state | .local/share | .cache | .ssh | .gnupg) return 1 ;; esac
+  return 0
+}
+
+# Remove children of other entries and duplicates (reads stdin, one path per line).
+normalize_paths() {
+  LC_ALL=C sort -u | awk '
+    { for (i = 1; i <= n; i++) if (index($0 "/", kept[i] "/") == 1) next
+      kept[++n] = $0; print }'
+}
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+is_interactive() { [[ -z "${OMARCHY_PR_YES:-}" ]] && is_tty; }
+
+_gum_default=""
+gum_confirm() {
+  if [[ -z "$_gum_default" ]]; then
+    local help
+    help=$(gum confirm --help 2>&1 || true)
+    if [[ "$help" == *--default* ]]; then _gum_default=1; else _gum_default=0; fi
+  fi
+  # Default to "No" so that pressing Enter never approves something risky.
+  if [[ "$_gum_default" == 1 ]]; then gum confirm --default=false "$1"; else gum confirm "$1"; fi
+}
+
+ask_yn() {
+  if has gum; then
+    gum_confirm "$1"
+  else
+    local a
+    read -r -p "$1 [y/N] " a || return 1
+    [[ "$a" =~ ^[Yy]$ ]]
+  fi
+}
+
+# Ordinary question. OMARCHY_PR_YES answers yes.
+confirm() {
+  [[ -n "${OMARCHY_PR_YES:-}" ]] && return 0
+  ask_yn "$1"
+}
+
+# Never skipped by OMARCHY_PR_YES and never works without a real terminal.
+# Anything that leaves your machine, or needs a human decision, uses this.
+confirm_always() {
+  is_tty || return 1
+  ask_yn "$1"
+}
+
+# You have to type the answer. For things that should never be a reflex.
+confirm_typed() { # prompt expected
+  is_tty || return 1
+  local a
+  read -r -p "$1 (type '$2' to continue) " a || return 1
+  [[ "$a" == "$2" ]]
+}
+
+# --------------------------------------------------- state, lock, cleanup
+
+CLEANUP_FILES=()
+CLEANUP_DIRS=()
+CLEANUP_WT=""
+
+cleanup() {
+  local x
+  for x in "${CLEANUP_FILES[@]:-}"; do
+    if [[ -n "$x" ]]; then rm -f -- "$x"; fi
+  done
+  for x in "${CLEANUP_DIRS[@]:-}"; do
+    if [[ -n "$x" ]]; then rm -rf -- "$x"; fi
+  done
+  if [[ -n "$CLEANUP_WT" ]]; then
+    git -C "$CHECKOUT" worktree remove --force "$CLEANUP_WT" >/dev/null 2>&1 || rm -rf -- "$CLEANUP_WT"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ensure_state() {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE" 2>/dev/null || true
+}
+
+_locked=""
+lock() {
+  [[ -z "$_locked" ]] || return 0
+  ensure_state
+  if has flock; then
+    exec 9>"$STATE/lock"
+    flock -n 9 || die "another omarchy-pr-try is already running"
+  fi
+  _locked=1
+}
+
+# The active-session file is plain key=value lines. It is only ever read with
+# grep, never sourced, so nothing in it can run.
+meta() { grep -m1 "^$1=" "$ACTIVE" 2>/dev/null | cut -d= -f2- || true; }
+
+write_active() { # key value [key value ...]  (replaces the file)
+  local tmp
+  tmp=$(mktemp "$STATE/.active.XXXXXX")
+  while (( $# >= 2 )); do
+    printf '%s=%s\n' "$1" "$(clean "$2")"
+    shift 2
+  done >"$tmp"
+  mv -f "$tmp" "$ACTIVE"
+}
+
+set_meta() { # key value
+  local tmp
+  tmp=$(mktemp "$STATE/.active.XXXXXX")
+  { grep -v "^$1=" "$ACTIVE" 2>/dev/null || true; printf '%s=%s\n' "$1" "$(clean "$2")"; } >"$tmp"
+  mv -f "$tmp" "$ACTIVE"
+}
+
+usage() { sed -n '2,/^# Read it first/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- git side
+
+g() { git -C "$CHECKOUT" -c core.quotePath=false "$@"; }
+
+export GIT_TERMINAL_PROMPT=0
+
+ensure_checkout() {
+  mkdir -p "$WORK"
+  : >"$WORK/.omarchy-pr-try"
+  if [[ ! -d "$CHECKOUT/.git" ]]; then
+    git clone --quiet --filter=blob:none "$REMOTE" "$CHECKOUT" || return 1
+  fi
+  g fetch --quiet origin || return 1
+}
+
+_gh_ready=""
+gh_ready() {
+  if [[ -z "$_gh_ready" ]]; then
+    if has gh && gh auth status >/dev/null 2>&1; then _gh_ready=1; else _gh_ready=0; fi
+  fi
+  [[ "$_gh_ready" == 1 ]]
+}
+
+PR_REV=""        # commit of the PR head
+PR_BASE=""       # branch the PR targets
+PR_BASE_KNOWN=0  # 1 when GitHub told us, 0 when we had to guess
+PR_STATE=""
+PR_DRAFT=""
+RANGE=""         # origin/<base>...<head>
+
+# PRs in this repo do not all target the default branch (dev, quattro and
+# master are all in use), so diffing against origin/HEAD gives wrong results.
+resolve_base() { # pr
+  local pr="$1" line="" b best="" bestn=0 n
+  PR_BASE=""; PR_BASE_KNOWN=0; PR_STATE=""; PR_DRAFT=""
+  if gh_ready; then
+    line=$(gh pr view "$pr" -R "$REPO" --json baseRefName,state,isDraft \
+      --jq '[.baseRefName, .state, (.isDraft | tostring)] | @tsv' 2>/dev/null) || line=""
+  elif has curl && has jq; then
+    line=$(curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/pulls/$pr" 2>/dev/null \
+      | jq -r '[.base.ref, (if .merged then "MERGED" else (.state | ascii_upcase) end), (.draft | tostring)] | @tsv' 2>/dev/null) || line=""
+  fi
+  if [[ -n "$line" ]]; then
+    IFS=$'\t' read -r PR_BASE PR_STATE PR_DRAFT _ <<<"$line" || true
+    if [[ "$PR_BASE" =~ ^[A-Za-z0-9._/-]+$ ]] && g rev-parse --verify -q "refs/remotes/origin/$PR_BASE" >/dev/null; then
+      PR_BASE_KNOWN=1
+    else
+      PR_BASE=""
+    fi
+  fi
+  if [[ -z "$PR_BASE" ]]; then
+    # Offline or API problem: pick the branch the PR is closest to.
+    for b in dev quattro omarchy-4 master main; do
+      g rev-parse --verify -q "refs/remotes/origin/$b" >/dev/null || continue
+      n=$(g rev-list --count "origin/$b..$PR_REV" 2>/dev/null || echo 999999)
+      if [[ -z "$best" ]] || (( n < bestn )); then best="$b"; bestn="$n"; fi
+    done
+    if [[ -z "$best" ]]; then
+      best=$(g symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)
+      best="${best#origin/}"
+    fi
+    [[ -n "$best" ]] || return 1
+    PR_BASE="$best"
+  fi
+  RANGE="origin/$PR_BASE...$PR_REV"
+}
+
+# Fetch the PR head and work out its base. Sets PR_REV, PR_BASE, RANGE.
+# Call it as: fetch_pr N || die ...   (never inside $( ), the globals would be lost)
+fetch_pr() { # pr
+  local pr="$1"
+  ensure_checkout || return 1
+  g fetch --quiet origin "pull/$pr/head" || return 1
+  PR_REV=$(g rev-parse "FETCH_HEAD^{commit}") || return 1
+  # Keep every commit we looked at reachable, so a force-push cannot erase it.
+  g update-ref "refs/pr-try/$pr/${PR_REV:0:12}" "$PR_REV" || true
+  resolve_base "$pr" || return 1
+}
+
+show_pr_header() { _show_pr_header "$@" | colorize; }
+
+_show_pr_header() { # pr
+  local pr="$1" subject
+  subject=$(g log -1 --format=%s "$PR_REV" | sanitize)
+  echo
+  echo "PR #$pr: $subject"
+  echo "  commit ${PR_REV:0:12}   base $PR_BASE$( ((PR_BASE_KNOWN)) || echo ' (guessed)')${PR_STATE:+   state $PR_STATE}$([[ "$PR_DRAFT" == true ]] && echo '   draft')"
+  echo "  $(g diff --shortstat "$RANGE")"
+  echo "  https://github.com/$REPO/pull/$pr/files"
+  if (( ! PR_BASE_KNOWN )); then
+    echo "  ! could not ask GitHub which branch this PR targets; I guessed '$PR_BASE'."
+    echo "    If that is wrong, the scan below is wrong too. Log in with: gh auth login"
+  fi
+  case "$PR_STATE" in
+    MERGED) echo "  ! this PR is already merged; its changes are probably in your Omarchy already" ;;
+    CLOSED) echo "  ! this PR is closed" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- listing
+
+# shellcheck disable=SC2016  # the $ and \( in the jq programs are jq's, not the shell's
+list_tsv() {
+  local limit="${OMARCHY_PR_LIMIT:-100}"
+  if gh_ready; then
+    gh pr list -R "$REPO" --state open --limit "$limit" \
+      --json number,title,author,isDraft,additions,deletions,statusCheckRollup,baseRefName \
+      --jq 'def st: .conclusion // .state // "";
+            .[] | ((.statusCheckRollup // []) | map(st)) as $s
+            | [ .number,
+                (.title | gsub("[\\t\\n]"; " ")),
+                (.author.login // "?"),
+                (if .isDraft then "draft" else "" end),
+                "+\(.additions)/-\(.deletions)",
+                (if ($s | length) == 0 then "-"
+                 elif ($s | any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT")) then "fail"
+                 elif ($s | any(. == "" or . == "PENDING" or . == "EXPECTED")) then "pending"
+                 else "pass" end),
+                .baseRefName ]
+            | @tsv'
+  elif has curl && has jq; then
+    curl -fsSL "https://api.github.com/repos/$REPO/pulls?state=open&per_page=$((limit > 100 ? 100 : limit))" \
+      | jq -r '.[] | [ .number, (.title | gsub("[\\t\\n]"; " ")), (.user.login // "?"),
+                       (if .draft then "draft" else "" end), "", "?", .base.ref ] | @tsv'
+  else
+    die "to list PRs I need gh (logged in), or curl and jq"
+  fi
+}
+
+cmd_list() {
+  list_tsv | sanitize | awk -F'\t' '{
+    printf "#%-6s %-9s %s (@%s) %s%s%s\n", $1, "[" $6 "]", $2, $3, $5, ($4 == "draft" ? " [draft]" : ""), ($7 != "" ? " → " $7 : "")
+  }'
+}
+
+# ---------------------------------------------------------------- risk scan
+
+# Print every added line of the PR as: file<TAB>line<TAB>text
+# Lines ending in a backslash are joined with the next one, so a command split
+# over two lines is still seen as one.
+scan_added() {
+  g diff -U0 --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ "$RANGE" | awk '
+    function flush() { if (have) { print bfile "\t" bline "\t" buf; have = 0; buf = "" } }
+    /^diff --git/ { flush(); inhunk = 0; next }
+    /^\+\+\+ / && !inhunk {
+      f = substr($0, 5); sub(/\t.*$/, "", f)
+      if (f ~ /^"b\//) { f = substr(f, 4); sub(/"$/, "", f) }
+      else if (f ~ /^b\//) { f = substr(f, 3) }
+      else { f = "" }
+      file = f; next
+    }
+    /^@@ / { flush(); inhunk = 1; match($0, /\+[0-9]+/); line = substr($0, RSTART + 1, RLENGTH - 1) + 0; next }
+    inhunk && /^\+/ {
+      s = substr($0, 2)
+      if (!have) { have = 1; bfile = file; bline = line; buf = s } else { buf = buf " " s }
+      if (s ~ /\\[ \t]*$/) { sub(/\\[ \t]*$/, "", buf) } else { flush() }
+      line++; next
+    }
+    END { flush() }
+  '
+}
+
+_max=0
+_out=""
+RISK_LEVEL=LOW
+
+flag() { # LEVEL label [detail]
+  local lvl="$1" label="$2" detail="${3:-}" n
+  case "$lvl" in HIGH) n=3 ;; MEDIUM) n=2 ;; *) n=1 ;; esac
+  if (( n > _max )); then _max=$n; fi
+  _out+="  [$lvl] $label"$'\n'
+  if [[ -n "$detail" ]]; then _out+="$detail"$'\n'; fi
+}
+
+# Needs RANGE (call fetch_pr first). Sets RISK_LEVEL and prints the report.
+analyze() {
+  local tmp files nfiles rule lvl label re only hits count ex raw numstat names n
+  tmp=$(mktemp)
+  CLEANUP_FILES+=("$tmp")
+  scan_added >"$tmp"
+  files=$(g diff --name-only "$RANGE")
+  nfiles=$(awk 'NF { c++ } END { print c + 0 }' <<<"$files")
+  _max=0
+  _out=""
+
+  # What kind of files changed.
+  if grep -q '^migrations/' <<<"$files"; then
+    flag MEDIUM "adds or changes a migration (runs once when you update)"
+  fi
+  if grep -q '^install/' <<<"$files"; then
+    flag MEDIUM "changes install scripts"
+  fi
+  if grep -Eq '[.]packages$' <<<"$files"; then
+    flag MEDIUM "changes a package list"
+  fi
+  if grep -q '^[.]github/workflows/' <<<"$files"; then
+    flag MEDIUM "changes CI workflows"
+  fi
+  if grep -qx '[.]gitmodules' <<<"$files"; then
+    flag MEDIUM "changes git submodules"
+  fi
+  if grep -q '^bin/' <<<"$files"; then
+    flag LOW "changes scripts in bin/ (they run on your machine)"
+  fi
+  if (( nfiles > 40 )); then
+    flag LOW "large PR: $nfiles files"
+  fi
+
+  # Files the line scan cannot read, and files that act like code.
+  raw=$(g diff --raw --no-abbrev "$RANGE")
+  n=$(awk -F'\t' '$1 ~ / 120000 / { c++ } END { print c + 0 }' <<<"$raw")
+  if (( n > 0 )); then
+    flag MEDIUM "adds or changes symlinks ($n)" "$(awk -F'\t' '$1 ~ / 120000 / && c < 3 { print "      " $2; c++ }' <<<"$raw")"
+  fi
+  n=$(awk -F'\t' '$1 ~ / 160000 / { c++ } END { print c + 0 }' <<<"$raw")
+  if (( n > 0 )); then
+    flag MEDIUM "adds or changes git submodules ($n)" "$(awk -F'\t' '$1 ~ / 160000 / && c < 3 { print "      " $2; c++ }' <<<"$raw")"
+  fi
+  n=$(awk -F'\t' '$1 ~ / 100755 / && $1 !~ /^:100755 / { c++ } END { print c + 0 }' <<<"$raw")
+  if (( n > 0 )); then
+    flag LOW "adds or changes executable files ($n)" "$(awk -F'\t' '$1 ~ / 100755 / && $1 !~ /^:100755 / && c < 3 { print "      " $2; c++ }' <<<"$raw")"
+  fi
+  numstat=$(g diff --numstat "$RANGE")
+  names=$(awk -F'\t' '$1 == "-" && $2 == "-" && tolower($3) !~ /[.](png|jpe?g|webp|gif|ico|icns|avif|ttf|otf|woff2?|mp3|ogg|wav|mp4|webm)$/ { print $3 }' <<<"$numstat")
+  n=$(awk 'NF { c++ } END { print c + 0 }' <<<"$names")
+  if (( n > 0 )); then
+    flag MEDIUM "adds or changes binary files the scan cannot read ($n)" "$(awk 'NF && c < 3 { print "      " $0; c++ }' <<<"$names")"
+  fi
+
+  # What the added lines do.
+  for rule in "${RULES[@]}"; do
+    IFS='~' read -r lvl label re only <<<"$rule"
+    hits=$(RE="$re" ONLY="$only" awk -F'\t' '
+      { t = $0; sub(/^[^\t]*\t[^\t]*\t/, "", t) }
+      $1 ~ /[.]md$/ { next }
+      ENVIRON["ONLY"] != "" && $1 !~ ENVIRON["ONLY"] { next }
+      t ~ /^[[:space:]]*#/ { next }
+      $1 ~ /[.]lua$/ && t ~ /^[[:space:]]*--/ { next }
+      $1 ~ /[.](qml|js)$/ && t ~ /^[[:space:]]*\/\// { next }
+      t ~ ENVIRON["RE"] { sub(/^[[:space:]]+/, "", t); print "      " $1 ":" $2 ": " substr(t, 1, 90) }
+    ' "$tmp")
+    if [[ -n "$hits" ]]; then
+      count=$(awk 'NF { c++ } END { print c + 0 }' <<<"$hits")
+      ex=$(sed -n '1,3p' <<<"$hits")
+      if (( count > 3 )); then ex+=$'\n'"      (+$((count - 3)) more)"; fi
+      flag "$lvl" "$label" "$ex"
+    fi
+  done
+  rm -f "$tmp"
+
+  case $_max in 3) RISK_LEVEL=HIGH ;; 2) RISK_LEVEL=MEDIUM ;; *) RISK_LEVEL=LOW ;; esac
+  {
+    echo
+    echo "Risk: $RISK_LEVEL"
+    if (( nfiles == 0 )); then
+      echo "  no changes compared with $PR_BASE"
+    elif [[ -n "$_out" ]]; then
+      printf '%s' "$_out"
+    else
+      echo "  nothing flagged by the pattern scan"
+    fi
+    echo
+    echo "Changed files:"
+    g diff --name-status "$RANGE" | sed -n '1,12p' | sed 's/^/  /'
+    if (( nfiles > 12 )); then echo "  (+$((nfiles - 12)) more)"; fi
+    echo
+    echo "This is a pattern scan, not a review. Read the diff before you trust it."
+  } | sanitize | colorize
+}
+
+remember_review() { # pr
+  ensure_state
+  mkdir -p "$REVIEWED_DIR"
+  printf '%s\n' "$PR_REV" >"$REVIEWED_DIR/pr-$1"
+  echo "Reviewed commit saved (${PR_REV:0:12}). 'try' warns you if the PR changes after this."
+}
+
+cmd_risk() {
+  local pr="$1"
+  valid_pr "$pr"
+  need git
+  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
+  show_pr_header "$pr"
+  analyze
+  remember_review "$pr"
+}
+
+# If the PR changed since you looked at it, say so, and make a person decide.
+check_reviewed() { # pr   (returns 1 to cancel)
+  local f="$REVIEWED_DIR/pr-$1" old
+  [[ -f "$f" ]] || return 0
+  old=$(<"$f")
+  [[ "$old" =~ ^[0-9a-f]{40}$ && "$old" != "$PR_REV" ]] || return 0
+  echo
+  echo "WARNING: PR #$1 changed since you reviewed it:"
+  echo "  reviewed : ${old:0:12}"
+  echo "  current  : ${PR_REV:0:12}"
+  if g cat-file -e "$old^{commit}" 2>/dev/null; then
+    echo "New commits:"
+    g log --oneline --no-decorate -n 15 "$old..$PR_REV" | sanitize | sed 's/^/  /'
+  else
+    echo "(the commit you reviewed is no longer available to compare)"
+  fi
+  if ! confirm_always "The code is not what you reviewed. Continue anyway?"; then
+    echo "Review it again first: omarchy-pr-try risk $1"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- checks
+
+is_shell_file() { # path-in-worktree relative-name
+  local first=""
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  case "$2" in *.sh) return 0 ;; esac
+  IFS= read -r first <"$1" 2>/dev/null || true
+  [[ "$first" =~ ^#!.*[[:space:]/](ba)?sh([[:space:]]|$) ]]
+}
+
+_sandbox=""
+sandbox_ok() {
+  has bwrap || return 1
+  if [[ -z "$_sandbox" ]]; then
+    if bwrap --ro-bind / / --unshare-user true >/dev/null 2>&1; then _sandbox=1; else _sandbox=0; fi
+  fi
+  [[ "$_sandbox" == 1 ]]
+}
+
+# Run a command with no network, an empty home, no secrets in the environment,
+# no access to your session buses, and no way to become root. /tmp is throwaway,
+# so TMPDIR points at a folder that is kept: the repo's runner writes one log per
+# test file there, and AGENTS.md says to read a failure from that log.
+sandbox_run() { # dir logs cmd args...
+  local dir="$1" logs="$2"; shift 2
+  local net=(--unshare-net)
+  if [[ -n "${OMARCHY_PR_TEST_NET:-}" ]]; then net=(); fi
+  timeout "${OMARCHY_PR_TEST_TIMEOUT:-900}" bwrap \
+    --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run --tmpfs "$HOME" \
+    --bind "$dir" "$dir" --bind "$logs" "$logs" --chdir "$dir" \
+    --unshare-user --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try "${net[@]}" \
+    --die-with-parent --new-session --cap-drop ALL \
+    --clearenv --setenv HOME "$HOME" --setenv PATH "$dir/bin:/usr/local/bin:/usr/bin" \
+    --setenv OMARCHY_PATH "$dir" --setenv TMPDIR "$logs" --setenv TERM "${TERM:-dumb}" --setenv LANG "${LANG:-C.UTF-8}" \
+    "$@"
+}
+
+# The repo's suite is built to run headless and offline (compositor tests skip
+# themselves), so a failure is most likely a real one. Do not nudge people into
+# loosening the sandbox.
+test_failed() { # runner logs
+  say "  ✗ $1 failed. Each test file's log is in $2"
+  say "  ! if it is a file this PR did not touch, check whether it also fails on the base branch"
+}
+
+cmd_test() {
+  local pr="$1" wt f rc=0 n=0 runner="" ranrepo=0 shown logs=""
+  valid_pr "$pr"
+  need git
+  lock
+  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
+  show_pr_header "$pr"
+  echo
+  echo "Syntax checks only read the files. The repo's own tests run the PR's code,"
+  echo "so they run inside a sandbox (no network, empty home, no root)."
+  if ! confirm "Run checks for PR #$pr?"; then note "cancelled"; return 0; fi
+
+  wt="$WORK/wt-$pr"
+  g worktree prune
+  rm -rf "$wt"
+  g worktree add --quiet --detach "$wt" "$PR_REV"
+  CLEANUP_WT="$wt"
+
+  # 1. Syntax of the shell scripts the PR touches.
+  while IFS= read -r -d '' f; do
+    is_shell_file "$wt/$f" "$f" || continue
+    n=$((n + 1))
+    shown=$(clean "$f")
+    if ! bash -n "$wt/$f" 2>/dev/null; then
+      say "  ✗ syntax error: $shown"
+      rc=1
+    elif has shellcheck && ! shellcheck -S warning "$wt/$f" >/dev/null 2>&1; then
+      say "  ! shellcheck warnings: $shown"
+    fi
+  done < <(g diff -z --name-only --diff-filter=AM "$RANGE")
+  if (( rc == 0 )); then say "  ✓ syntax ok ($n scripts)"; fi
+
+  # 2. The repo's own test runner, if it has one.
+  if [[ -x "$wt/test/all" ]]; then runner=test/all; elif [[ -x "$wt/test/cli" ]]; then runner=test/cli; fi
+  if [[ -n "$runner" ]]; then
+    # Kept after the run: the runner writes one log per test file under $TMPDIR.
+    logs="$WORK/test-logs/pr-$pr"
+    rm -rf -- "$logs"
+    mkdir -p "$logs"
+  fi
+  if [[ -z "$runner" ]]; then
+    echo "  (no test/all or test/cli in this PR, so only the syntax checks ran)"
+  elif sandbox_ok; then
+    note "running $runner in a sandbox"
+    ranrepo=1
+    if ! sandbox_run "$wt" "$logs" "./$runner"; then
+      test_failed "$runner" "$logs"
+      rc=1
+    fi
+    echo "  test logs: $logs"
+  elif [[ -n "${OMARCHY_PR_UNSAFE_TEST:-}" ]] \
+    && confirm_always "No sandbox here. Run $runner directly on your machine, with full access to your files?"; then
+    ranrepo=1
+    if ! ( cd "$wt" && env -i HOME="$HOME" PATH="$wt/bin:/usr/local/bin:/usr/bin" OMARCHY_PATH="$wt" TMPDIR="$logs" TERM="${TERM:-dumb}" "./$runner" ); then
+      test_failed "$runner" "$logs"
+      rc=1
+    fi
+    echo "  test logs: $logs"
+  else
+    say "  ! $runner skipped: running a PR's code needs a sandbox (omarchy-pkg-add bubblewrap)"
+  fi
+
+  echo
+  if (( rc != 0 )); then
+    say "Some checks failed."
+  elif (( ranrepo )); then
+    say "Checks passed."
+  else
+    say "Syntax checks passed. The repo's tests did not run."
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- the dev link
+
+supports_flag() { # command flag
+  local f
+  f=$(command -v "$1" 2>/dev/null) || return 1
+  [[ -f "$f" && -r "$f" ]] || return 1
+  grep -qs -- "$2" "$f"
+}
+
+# Where /etc/omarchy.conf says OMARCHY_PATH points (empty if it does not).
+current_link_path() {
+  local owner
+  [[ -r "$OMARCHY_CONF" ]] || return 0
+  owner=$(stat -c %u "$OMARCHY_CONF" 2>/dev/null || echo -1)
+  [[ "$owner" == 0 || "$owner" == "$(id -u)" ]] || return 0
+  # shellcheck disable=SC1090
+  ( set +eu; . "$OMARCHY_CONF" >/dev/null 2>&1; printf '%s' "${OMARCHY_PATH:-}" ) || true
+}
+
+link_is_ours() {
+  local p
+  p=$(current_link_path)
+  [[ -n "$p" && ( "$p" == "$CHECKOUT" || "$p" == "$CHECKOUT"/* ) ]]
+}
+
+link_to() { # path
+  local args=("$1")
+  if supports_flag omarchy-dev-link --no-reboot; then args+=(--no-reboot); fi
+  omarchy-dev-link "${args[@]}"
+}
+
+unlink_now() {
+  local args=()
+  if supports_flag omarchy-dev-unlink --no-reboot; then args+=(--no-reboot); fi
+  omarchy-dev-unlink "${args[@]}"
+}
+
+preflight_link() {
+  if has omarchy-dev-link && has omarchy-dev-unlink; then return 0; fi
+  die "omarchy-dev-link / omarchy-dev-unlink not found. They ship with Omarchy 4 (Quattro); this tool cannot switch an older install."
+}
+
+offer_reboot() {
+  local pr=$(meta pr 2>/dev/null)
+  echo
+  echo "PR #$pr is now active:"
+  echo "  commit   $(meta sha 2>/dev/null | cut -c1-12)  ·  $(meta title 2>/dev/null | sanitize | head -c 60)"
+  echo "  base     $(meta base 2>/dev/null | sanitize)"
+  echo "  /etc/omarchy.conf now points at the downloaded PR code"
+  echo "  new terminal shells will use this code immediately"
+  if is_tty && { [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || command -v hyprctl >/dev/null 2>&1; }; then
+    echo "  a running graphical session will NOT hot-reload these changes"
+    echo "  (the dock, themes and QML plugins only appear after a session restart)"
+  fi
+  echo
+  echo "  verify in a new shell:"
+  echo "    command -v omarchy-dock"
+  echo "  → should resolve to $CHECKOUT/bin/omarchy-dock"
+  echo
+  if confirm_always "Reboot now so the whole session uses the PR's code?"; then
+    if has omarchy-system-reboot; then omarchy-system-reboot; else systemctl reboot; fi
+  fi
+}
+
+# ---------------------------------------------------------------- backup
+
+# Paths to back up: the fixed list, anything you added, and the config folders
+# that this PR's own config/ changes would overwrite after a refresh.
+derive_backup_paths() {
+  local p c extra=()
+  for p in "${BACKUP_PATHS[@]}"; do printf '%s\n' "$p"; done
+  read -r -a extra <<<"${OMARCHY_PR_BACKUP_EXTRA:-}" || true
+  for p in "${extra[@]:-}"; do
+    if [[ -n "$p" ]]; then printf '%s\n' "${p#"$HOME"/}"; fi
+  done
+  while IFS= read -r -d '' p; do
+    c=${p#config/}
+    c=${c%%/*}
+    if [[ -n "$c" && "$c" != . && "$c" != .. ]]; then printf '.config/%s\n' "$c"; fi
+  done < <(g diff -z --name-only "$RANGE" -- config/)
+}
+
+make_backup() {
+  local cands=() keep=() absent=() p size tmp rc=0
+  mapfile -t cands < <(derive_backup_paths | normalize_paths)
+  for p in "${cands[@]}"; do
+    if ! valid_rel "$p"; then
+      warn "skipping a path I will not touch: $(clean "$p")"
+      continue
+    fi
+    if [[ -e "$HOME/$p" || -L "$HOME/$p" ]]; then
+      keep+=("$p")
+      if [[ -L "$HOME/$p" ]]; then
+        warn "$p is a symlink: only the link is backed up, not what it points to"
+      fi
+    else
+      absent+=("$p")
+    fi
+  done
+  (( ${#keep[@]} )) || die "nothing to back up; check BACKUP_PATHS"
+
+  size=$( { cd "$HOME" && du -smc -- "${keep[@]}" 2>/dev/null || true; } | awk 'END { print $1 + 0 }')
+  if (( size > BACKUP_MAX_MB )); then
+    die "the config to back up is ${size} MB (limit ${BACKUP_MAX_MB}); set OMARCHY_PR_BACKUP_MAX_MB if that is expected"
+  fi
+
+  tmp="$BACKUP.partial"
+  rm -f "$tmp"
+  ( umask 077; tar -C "$HOME" -czf "$tmp" -- "${keep[@]}" ) || rc=$?
+  # tar exits 1 when a file changed while it was read; that is fine for config.
+  if (( rc > 1 )); then rm -f "$tmp"; die "backup failed; nothing was changed"; fi
+  tar -tzf "$tmp" >/dev/null || { rm -f "$tmp"; die "backup is not readable; nothing was changed"; }
+  mv -f "$tmp" "$BACKUP"
+  sha256sum "$BACKUP" | cut -d' ' -f1 >"$BACKUP_SUM"
+  printf '%s\n' "${keep[@]}" >"$PATHS_FILE"
+  if (( ${#absent[@]} )); then printf '%s\n' "${absent[@]}" >"$ABSENT_FILE"; else : >"$ABSENT_FILE"; fi
+  note "backed up ${#keep[@]} config folders (${size} MB)"
+}
+
+save_packages() {
+  has pacman || return 0
+  { pacman -Q 2>/dev/null | sort >"$PKGS_BEFORE"; } || true
+}
+
+# A system snapshot is required before every try, whatever the risk: it is the
+# only way back for /etc and packages. Only a deliberate override skips it.
+SNAPSHOT=none
+snapshot_precheck() { # cheap check up front, before any prompt
+  if has omarchy-snapshot || [[ -n "${OMARCHY_PR_ALLOW_NO_SNAPSHOT:-}" ]]; then return 0; fi
+  die "omarchy-snapshot not found, so there is no system snapshot to fall back on."$'\n'"  A snapshot is required before every try. Omarchy snapshots need the Limine bootloader (GRUB and systemd-boot have none)."$'\n'"  Run 'omarchy-pr-try doctor', or set OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 if you accept the risk."
+}
+
+take_snapshot() { # dies if there is no snapshot and no override
+  SNAPSHOT=none
+  if has omarchy-snapshot; then
+    note "taking a system snapshot"
+    if omarchy-snapshot create; then SNAPSHOT=ok; return 0; fi
+    warn "the snapshot failed"
+  else
+    warn "omarchy-snapshot not found"
+  fi
+  if [[ -n "${OMARCHY_PR_ALLOW_NO_SNAPSHOT:-}" ]]; then
+    warn "going on WITHOUT a snapshot because OMARCHY_PR_ALLOW_NO_SNAPSHOT is set: /etc and packages cannot be rolled back"
+    return 0
+  fi
+  die "no system snapshot, so nothing was changed."$'\n'"  A snapshot is required before every try: it is the way back for /etc and packages."$'\n'"  Snapshots only work with the Limine bootloader (GRUB and systemd-boot have none)."$'\n'"  Run 'omarchy-pr-try doctor', or set OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 if you accept the risk."
+}
+
+# ---------------------------------------------------------------- try
+
+try_pr() {
+  local pr="$1" want_sha="${2:-}" title prev
+  valid_pr "$pr"
+  [[ -z "$want_sha" || "$want_sha" =~ ^[0-9a-f]{7,40}$ ]] || die "SHA must be 7 to 40 hex characters"
+  need git
+  preflight_link
+  lock
+  if [[ -f "$ACTIVE" ]]; then
+    die "PR #$(meta pr) is already active ($(meta phase)); run 'omarchy-pr-try back' first"
+  fi
+  snapshot_precheck
+
+  note "fetching PR #$pr"
+  fetch_pr "$pr" || die "could not fetch PR #$pr (does it exist?)"
+  if [[ -n "$want_sha" && "$PR_REV" != "$want_sha"* ]]; then
+    die "PR #$pr is now at ${PR_REV:0:12}, not $want_sha. It changed; review it again."
+  fi
+  title=$(g log -1 --format=%s "$PR_REV")
+  check_reviewed "$pr" || { note "cancelled"; return 0; }
+  show_pr_header "$pr"
+  analyze
+
+  echo
+  echo "If you continue, this PR's code runs as you, and through sudo: while it is linked,"
+  echo "'sudo omarchy-*' resolves to the PR's own scripts."
+  if has omarchy-snapshot; then echo "A system snapshot is taken first; it is the way back for /etc and packages."; fi
+  if [[ "$RISK_LEVEL" == HIGH ]]; then
+    if [[ -n "${OMARCHY_PR_YES:-}" ]]; then
+      [[ -n "${OMARCHY_PR_ALLOW_HIGH:-}" ]] || die "risk is HIGH; refusing without a person at the keyboard (OMARCHY_PR_ALLOW_HIGH=1 overrides)"
+    elif [[ -z "${OMARCHY_PR_ALLOW_HIGH:-}" ]]; then
+      confirm_typed "Risk is HIGH. Only go on if you read the diff." "$pr" || { note "cancelled"; return 0; }
+    fi
+  else
+    confirm "Risk is $RISK_LEVEL. Switch this machine to PR #$pr?" || { note "cancelled"; return 0; }
+  fi
+
+  ensure_state
+  g checkout --quiet --force --detach "$PR_REV"
+  g clean -ffdxq
+
+  take_snapshot
+  note "backing up your config"
+  make_backup
+  save_packages
+  prev=""
+  if [[ -n "$(current_link_path)" ]] && ! link_is_ours && [[ "$(current_link_path)" != /usr/share/omarchy ]]; then
+    prev=$(current_link_path)
+    note "you already have a dev-link to $prev; it comes back when you go back"
+  fi
+
+  # Write the state first, so that if anything below is interrupted
+  # (a reboot prompt, Ctrl+C, a crash), 'back' knows what to undo.
+  write_active pr "$pr" sha "$PR_REV" title "$title" base "$PR_BASE" risk "$RISK_LEVEL" \
+    started "$(date -Is)" phase linking snapshot "$SNAPSHOT" prev_link "$prev"
+
+  note "switching to PR #$pr (this may ask for your password)"
+  if ! link_to "$CHECKOUT"; then
+    warn "dev-link failed; undoing"
+    if link_is_ours; then
+      if unlink_now; then
+        if [[ -n "$prev" && -d "$prev" ]]; then link_to "$prev" || true; fi
+        rm -f "$ACTIVE"
+        die "dev-link failed; everything was put back"
+      fi
+      die "dev-link failed and I could not unlink. Run 'omarchy-pr-try back'."
+    fi
+    rm -f "$ACTIVE"
+    die "dev-link failed; nothing was switched"
+  fi
+  set_meta phase linked
+
+  if has omarchy-dev-status; then omarchy-dev-status || true; fi
+  echo
+  echo "Done. PR #$pr is linked. Reboot so the whole session (shell, compositor, services)"
+  echo "uses the PR's code; a terminal opened now already does."
+  echo "When you are finished: omarchy-pr-try back"
+  echo "Do not run 'omarchy update' while a PR is linked: in dev-link mode it fast-forwards"
+  echo "the linked checkout from its upstream. Go back first."
+  offer_reboot
+}
+
+# ---------------------------------------------------------------- back
+
+VERDICT=unrated
+NOTE_TEXT=""
+COMMENT_URL=""
+
+# Ask how the PR went. Sets VERDICT and NOTE_TEXT.
+ask_verdict() {
+  local pr="$1"
+  VERDICT=unrated
+  NOTE_TEXT=""
+  is_interactive || return 0
+  if has gum; then
+    VERDICT=$(gum choose --header "How did PR #$pr go?" good problems unsure skip) || VERDICT=skip
+    NOTE_TEXT=$(gum input --placeholder "Optional note") || NOTE_TEXT=""
+  else
+    read -r -p "How did PR #$pr go? [good/problems/unsure, Enter to skip] " VERDICT || VERDICT=""
+    read -r -p "Note (optional): " NOTE_TEXT || NOTE_TEXT=""
+  fi
+  case "$VERDICT" in good | problems | unsure) ;; *) VERDICT=unrated ;; esac
+}
+
+write_history() { # started pr sha title verdict note comment_url risk
+  ensure_state
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "${3:0:7}" "$5" "$(clean "$4")" "$(clean "$6")" "$7" "${8:-}" >>"$HISTORY"
+}
+
+# What going back does NOT undo, and what changed in the package set.
+report_leftovers() { # snapshot-status
+  local after diff added removed changed
+  echo
+  echo "Not undone: files outside your config folders (for example in /etc), and packages."
+  if [[ "$1" == ok ]]; then
+    echo "A system snapshot was taken when you started. If the PR changed system files,"
+    echo "restore it (pick it in the Limine boot menu, or run omarchy-snapshot restore)."
+  else
+    echo "No system snapshot was taken for this test (the snapshot requirement was overridden)."
+  fi
+  if [[ -r "$PKGS_BEFORE" ]] && has pacman; then
+    after=$(mktemp)
+    CLEANUP_FILES+=("$after")
+    { pacman -Q 2>/dev/null | sort >"$after"; } || true
+    diff=$(awk '
+      NR == FNR { b[$1] = $2; next }
+      { a[$1] = $2 }
+      END {
+        for (k in a) if (!(k in b)) print "added " k
+        for (k in b) if (!(k in a)) print "removed " k
+        for (k in a) if ((k in b) && a[k] != b[k]) print "changed " k
+      }' "$PKGS_BEFORE" "$after" | LC_ALL=C sort)
+    added=$(awk '$1 == "added" { printf "%s ", $2 }' <<<"$diff")
+    removed=$(awk '$1 == "removed" { printf "%s ", $2 }' <<<"$diff")
+    changed=$(awk '$1 == "changed" { c++ } END { print c + 0 }' <<<"$diff")
+    if [[ -n "${added// /}" ]]; then
+      echo "Packages added since you started (check them before removing anything):"
+      echo "  $added"
+      echo "  to remove: omarchy-pkg-drop $added"
+    fi
+    if [[ -n "${removed// /}" ]]; then
+      echo "Packages removed since you started:"
+      echo "  $removed"
+      echo "  to put back: omarchy-pkg-add $removed   (AUR ones: omarchy-pkg-aur-add)"
+    fi
+    if (( changed > 0 )); then
+      echo "$changed packages changed version (normal if you updated meanwhile)."
+    fi
+  fi
+}
+
+check_restore_plan() { # stage
+  local stage="$1" p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    valid_rel "$p" || die "the backup list has a path I will not touch ($(clean "$p")); nothing was changed"
+    [[ -e "$stage/$p" || -L "$stage/$p" ]] || die "the backup is missing $p; nothing was changed"
+  done <"$PATHS_FILE"
+  if [[ -f "$ABSENT_FILE" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      valid_rel "$p" || die "the backup list has a path I will not touch ($(clean "$p")); nothing was changed"
+    done <"$ABSENT_FILE"
+  fi
+}
+
+rollback_restore() { # displaced-dir paths...
+  local disp="$1" p
+  shift
+  for p in "$@"; do
+    valid_rel "$p" || continue
+    rm -rf -- "${HOME:?}/$p"
+    if [[ -e "$disp/$p" || -L "$disp/$p" ]]; then
+      mv -T -- "$disp/$p" "$HOME/$p" || warn "could not put $p back; your copy is in $disp/$p"
+    fi
+  done
+}
+
+# Swap your saved config back in. Nothing is deleted: whatever is there now is
+# moved into the displaced folder first, and a failure puts everything back.
+restore_paths() { # stage displaced-dir
+  local stage="$1" disp="$2" p moved=()
+  mkdir -p "$disp"
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if [[ -e "$HOME/$p" || -L "$HOME/$p" ]]; then
+      mkdir -p "$disp/$(dirname "$p")"
+      if ! mv -T -- "$HOME/$p" "$disp/$p"; then
+        if (( ${#moved[@]} )); then rollback_restore "$disp" "${moved[@]}"; fi
+        return 1
+      fi
+    fi
+    moved+=("$p")
+    mkdir -p "$(dirname "$HOME/$p")"
+    if ! mv -T -- "$stage/$p" "$HOME/$p"; then
+      rollback_restore "$disp" "${moved[@]}"
+      return 1
+    fi
+  done <"$PATHS_FILE"
+  # Things the PR created that you did not have before.
+  if [[ -s "$ABSENT_FILE" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if [[ -e "$HOME/$p" || -L "$HOME/$p" ]]; then
+        mkdir -p "$disp/absent/$(dirname "$p")"
+        mv -T -- "$HOME/$p" "$disp/absent/$p" || warn "could not move $p aside"
+      fi
+    done <"$ABSENT_FILE"
+  fi
+}
+
+back() {
+  [[ -f "$ACTIVE" ]] || die "no PR is active"
+  lock
+  local pr sha title started phase prev risk snap stage disp want
+  pr=$(meta pr); sha=$(meta sha); title=$(meta title); started=$(meta started)
+  phase=$(meta phase); phase=${phase:-linked}
+  prev=$(meta prev_link); risk=$(meta risk); snap=$(meta snapshot)
+
+  if [[ "$phase" != restored ]]; then
+    [[ -f "$BACKUP" && -f "$PATHS_FILE" && -f "$BACKUP_SUM" ]] || die "the backup is missing; nothing was changed"
+    want=$(sha256sum "$BACKUP" | cut -d' ' -f1)
+    [[ "$want" == "$(<"$BACKUP_SUM")" ]] || die "the backup does not match its checksum; nothing was changed"
+    tar -tzf "$BACKUP" >/dev/null || die "the backup is damaged; nothing was changed"
+
+    # Unpack and check everything first, so a bad archive can never leave you with nothing.
+    stage=$(mktemp -d "$STATE/stage.XXXXXX")
+    CLEANUP_DIRS+=("$stage")
+    tar -C "$stage" -xzpf "$BACKUP" || die "could not unpack the backup; nothing was changed"
+    check_restore_plan "$stage"
+
+    if link_is_ours; then
+      note "returning Omarchy to its normal files"
+      need omarchy-dev-unlink
+      unlink_now || die "omarchy-dev-unlink failed; your config was not touched. Fix that, then run 'back' again."
+      if link_is_ours; then die "the link to the PR code is still in place; your config was not touched. Run 'back' again."; fi
+    else
+      note "the dev-link is already gone"
+    fi
+    if [[ -n "$prev" && -d "$prev" && "$(current_link_path)" != "$prev" ]]; then
+      note "putting your earlier dev-link back: $prev"
+      link_to "$prev" || warn "could not relink; run: omarchy-dev-link '$prev'"
+    fi
+
+    note "restoring your config"
+    disp="$DISPLACED_DIR/$(date +%Y%m%dT%H%M%S)-pr$pr"
+    restore_paths "$stage" "$disp" || die "could not restore your config; I put everything back as it was. Run 'back' again."
+    if [[ -d "$disp" && -z "$(find "$disp" -mindepth 1 -print -quit)" ]]; then
+      rmdir "$disp"
+    elif [[ -d "$disp" ]]; then
+      note "what was in those folders during the test is kept in $disp"
+    fi
+    set_meta phase restored
+  fi
+
+  report_leftovers "$snap"
+  ask_verdict "$pr"
+  COMMENT_URL=""
+  if [[ "$VERDICT" == problems || "$VERDICT" == good ]] && is_interactive; then
+    if [[ "$VERDICT" == good ]]; then
+      if confirm_always "It worked. Write a short 'tested, works for me' comment on PR #$pr?"; then
+        comment_flow "$pr" "$sha" "$NOTE_TEXT" good || true
+      fi
+    elif confirm_always "Write a comment to the author of PR #$pr now?"; then
+      comment_flow "$pr" "$sha" "$NOTE_TEXT" problems || true
+    fi
+  fi
+  write_history "$started" "$pr" "$sha" "$title" "$VERDICT" "$NOTE_TEXT" "$COMMENT_URL" "$risk"
+  rm -f "$ACTIVE"
+  echo
+  echo "Done. Your config is restored and the dev-link is gone."
+  if [[ -d "$CHECKOUT/.git" ]]; then
+    echo "The downloaded PR code is still in $WORK at commit $(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null | cut -c1-12);"
+    echo "run 'omarchy-pr-try clean' to remove it."
+  fi
+  echo "Reboot to finish going back (the running session still has the PR's code loaded)."
+  offer_reboot
+}
+
+# ---------------------------------------------------------------- clean
+
+# Delete the downloaded PR code. It refuses while anything still points at it,
+# because deleting the checkout under a live dev-link breaks omarchy commands.
+cmd_clean() {
+  local disp_size=""
+  lock
+  [[ ! -f "$ACTIVE" ]] || die "PR #$(meta pr) is still active; run 'back' first"
+  if [[ -z "$WORK" || "$WORK" == / || "$WORK" == "$HOME" || "$HOME/" == "$WORK"/* ]]; then
+    die "refusing to delete '$WORK'; check OMARCHY_PR_DIR"
+  fi
+  if [[ -d "$WORK" && ! -e "$WORK/.omarchy-pr-try" && ! -d "$CHECKOUT/.git" ]]; then
+    die "'$WORK' does not look like a folder this tool made; refusing to delete it"
+  fi
+  if link_is_ours; then
+    die "$OMARCHY_CONF still points at the downloaded code; run omarchy-dev-unlink first"
+  fi
+  if [[ "${OMARCHY_PATH:-}" == "$CHECKOUT"* ]]; then
+    die "this session still uses the downloaded code; reboot or log out and back in first"
+  fi
+  if [[ -d "$DISPLACED_DIR" ]]; then disp_size=$(du -sh "$DISPLACED_DIR" 2>/dev/null | cut -f1 || true); fi
+  if [[ ! -d "$WORK" && ! -e "$BACKUP" && -z "$disp_size" ]]; then
+    echo "nothing to clean"
+    return 0
+  fi
+
+  echo "This deletes:"
+  if [[ -d "$WORK" ]]; then echo "  $WORK ($(du -sh "$WORK" | cut -f1))"; fi
+  if [[ -e "$BACKUP" ]]; then echo "  $BACKUP (the config backup from your last test)"; fi
+  echo "It keeps your history, review notes and comment drafts."
+  if [[ -d "$WORK" || -e "$BACKUP" ]]; then
+    if ! confirm "Delete them?"; then note "cancelled"; return 0; fi
+    rm -rf "${WORK:?}"
+    rm -f "$BACKUP" "$BACKUP_SUM" "$PATHS_FILE" "$ABSENT_FILE" "$PKGS_BEFORE"
+    rm -rf "$STATE"/stage.*
+    echo "Done. No PR code is left on this machine."
+  fi
+  if [[ -n "$disp_size" ]]; then
+    echo
+    echo "Saved copies of your config from earlier tests: $DISPLACED_DIR ($disp_size)"
+    echo "These hold what you changed during those tests."
+    if confirm_always "Delete them too?"; then
+      rm -rf "${DISPLACED_DIR:?}"
+      echo "Deleted."
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- comments
+
+build_template() { # pr sha note [kind: problems|good]
+  local sha="$2" text="${3:-}" kind="${4:-problems}" ver="unknown"
+  if has omarchy-version; then ver=$(omarchy-version 2>/dev/null || echo unknown); fi
+  if [[ "$kind" == good ]]; then
+    cat <<EOF
+Thanks for working on this! I tried this PR on my machine and it worked for me.
+
+**What I tested**
+${text:-<describe what you tried>}
+
+This is a test report from my own setup. Whether to merge is up to the maintainers.
+
+<details>
+<summary>Tested on</summary>
+
+- PR commit: ${sha:0:7}
+- Omarchy: $ver
+- Date: $(date +%F)
+</details>
+EOF
+    return 0
+  fi
+  cat <<EOF
+Thanks for working on this! I tried this PR on my machine and ran into a problem.
+
+**What happened**
+${text:-<describe what went wrong>}
+
+**How to reproduce**
+1.
+
+**What I expected**
+
+
+<details>
+<summary>Tested on</summary>
+
+- PR commit: ${sha:0:7}
+- Omarchy: $ver
+- Date: $(date +%F)
+</details>
+EOF
+}
+
+# Let the user edit a draft file in place. Fails if they cancel or there is no terminal.
+edit_text() { # file header
+  local file="$1" header="$2" out
+  is_tty || return 1
+  if has gum; then
+    out=$(gum write --header "$header" --width 80 --height 20 --value "$(cat "$file")") || return 1
+    printf '%s\n' "$out" >"$file"
+  else
+    "${VISUAL:-${EDITOR:-nano}}" "$file"
+  fi
+}
+
+# Write a comment for the PR author and, after you confirm, post it with gh.
+# Sets COMMENT_URL when it was posted. The draft is kept if anything goes wrong.
+comment_flow() { # pr sha note [kind]
+  local pr="$1" sha="$2" text="${3:-}" kind="${4:-problems}" draft user
+  COMMENT_URL=""
+  ensure_state
+  mkdir -p "$STATE/drafts"
+  draft="$STATE/drafts/pr-$pr.md"
+  build_template "$pr" "$sha" "$text" "$kind" >"$draft"
+
+  if ! edit_text "$draft" "Comment for PR #$pr"; then
+    note "no comment posted. Draft kept at $draft"
+    return 0
+  fi
+  if ! grep -q '[^[:space:]]' "$draft"; then
+    note "the comment is empty, nothing posted"
+    rm -f "$draft"
+    return 0
+  fi
+
+  if grep -q '<describe what' "$draft"; then
+    note "the comment still has a <describe ...> placeholder, so nothing was posted. Draft kept at $draft"
+    return 0
+  fi
+
+  echo
+  echo "------------------------ comment ------------------------"
+  cat "$draft"
+  echo "---------------------------------------------------------"
+
+  if gh_ready; then
+    user=$(gh api user -q .login 2>/dev/null || true)
+    if confirm_always "Post this on PR #$pr as ${user:-your GitHub account}? Everyone can see it."; then
+      if COMMENT_URL=$(gh pr comment "$pr" -R "$REPO" --body-file "$draft"); then
+        note "posted: $COMMENT_URL"
+        rm -f "$draft"
+      else
+        COMMENT_URL=""
+        echo "Posting failed. Your draft is kept at $draft"
+      fi
+    else
+      note "not posted. Draft kept at $draft"
+    fi
+  else
+    # No logged-in gh: hand the text over so you can paste it yourself.
+    if has wl-copy; then
+      wl-copy <"$draft"
+      note "comment copied to the clipboard"
+    fi
+    note "gh is not logged in (run: gh auth login). Draft kept at $draft"
+    if confirm_always "Open PR #$pr in your browser to paste it?"; then
+      xdg-open "https://github.com/$REPO/pull/$pr" >/dev/null 2>&1 \
+        || echo "Open: https://github.com/$REPO/pull/$pr"
+    fi
+  fi
+}
+
+cmd_comment() {
+  local pr="$1" text="${2:-}" kind="${3:-problems}" sha=""
+  valid_pr "$pr"
+  if [[ -f "$ACTIVE" && "$(meta pr)" == "$pr" ]]; then
+    sha=$(meta sha)
+  else
+    sha=$(git ls-remote "$REMOTE" "refs/pull/$pr/head" 2>/dev/null | cut -f1 || true)
+  fi
+  comment_flow "$pr" "$sha" "$text" "$kind"
+}
+
+# ---------------------------------------------------------------- status / history / doctor / install
+
+cmd_verify() {
+  local cur_link head
+  echo "omarchy-pr-try $VERSION — active-PR verification"
+  echo
+  if [[ -f "$ACTIVE" ]]; then
+    echo "A PR is currently active:"
+    echo "  PR #$(meta pr | sanitize) · $(meta title | sanitize)"
+    echo "  commit $(meta sha | cut -c1-12) · base $(meta base | sanitize) · risk $(meta risk | sanitize)"
+    echo "  status: $(meta phase | sanitize)"
+  else
+    echo "No PR is active. You are running the normal Omarchy code."
+  fi
+  echo
+  cur_link=$(current_link_path)
+  if [[ -n "$cur_link" ]]; then
+    echo "Dev-link: /etc/omarchy.conf sets OMARCHY_PATH=\"$cur_link\""
+    if [[ "$cur_link" == "$CHECKOUT" || "$cur_link" == "$CHECKOUT"/* ]]; then
+      echo "  ✓ points at the downloaded PR code"
+      if [[ -d "$cur_link/.git" ]]; then
+        head=$(git -C "$cur_link" rev-parse HEAD 2>/dev/null | cut -c1-12)
+        echo "  ✓ checkout is at $head ($(git -C "$cur_link" rev-parse --abbrev-ref HEAD 2>/dev/null))"
+      fi
+    else
+      echo "  ! points elsewhere: '$cur_link'"
+    fi
+  else
+    echo "Dev-link: none (no OMARCHY_PATH override — running normal Omarchy)"
+  fi
+  echo
+  echo "In a fresh shell, verify the PR's code is in use:"
+  echo "  command -v omarchy-dock"
+  echo "→ $(command -v omarchy-dock 2>/dev/null || echo "  not available")"
+}
+
+cmd_status() {
+  local phase
+  if [[ -f "$ACTIVE" ]]; then
+    phase=$(meta phase)
+    echo "PR #$(meta pr) is active: $(meta title)"
+    echo "  commit $(meta sha | cut -c1-12), base $(meta base), risk $(meta risk), since $(meta started)"
+    case "$phase" in
+      restored) echo "  your config is restored; run 'back' to finish (rating, history)" ;;
+      linking) echo "  the switch did not finish; run 'back' to undo it" ;;
+    esac
+    if [[ "$phase" != restored ]] && ! link_is_ours; then
+      echo "  ! the dev-link is not in place; run 'back' to clean up"
+    fi
+  else
+    echo "no PR is active"
+  fi
+}
+
+cmd_history() {
+  if [[ ! -s "$HISTORY" ]]; then echo "no PRs tried yet"; return 0; fi
+  {
+    printf 'WHEN\tPR\tSHA\tVERDICT\tTITLE\tNOTE\tCOMMENT\tRISK\n'
+    sort -r "$HISTORY" | awk -F'\t' 'BEGIN { OFS = "\t" } {
+      $1 = substr($1, 1, 16); sub("T", " ", $1)
+      for (i = 1; i <= 8; i++) if ($i == "") $i = "-"
+      print }'
+  } | if has column; then column -t -s $'\t'; else cat; fi
+}
+
+cmd_doctor() {
+  local ok=1 cur
+  good() { printf '  ✓ %s: %s\n' "$1" "$2"; }
+  bad()  { printf '  ✗ %s: %s\n' "$1" "$2"; ok=0; }
+  echo "omarchy-pr-try $VERSION"
+  if has git; then good git found; else bad git "missing (needed)"; fi
+  if has gum; then good gum found; else bad gum "missing (needed for the menu)"; fi
+  if gh_ready; then
+    good gh "logged in"
+  elif has curl && has jq; then
+    good gh "not logged in; using the public API (rate-limited, no check status in the list)"
+  else
+    bad gh "not logged in, and curl+jq are missing, so I cannot list PRs"
+  fi
+  if has omarchy-dev-link && has omarchy-dev-unlink; then
+    good dev-link found
+    if supports_flag omarchy-dev-link --no-reboot; then
+      echo "    dev-link supports --no-reboot"
+    else
+      echo "    dev-link has no --no-reboot; it may offer a reboot (safe: state is saved first)"
+    fi
+  else
+    bad dev-link "missing: this needs Omarchy 4 (Quattro)"
+  fi
+  if has omarchy-snapshot; then
+    if has snapper; then
+      good snapshot "omarchy-snapshot and snapper found (a snapshot is taken before every try; it needs the Limine bootloader)"
+    else
+      bad snapshot "snapper is missing, so snapshots fail and every try will be refused (OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 overrides)"
+    fi
+  else
+    bad snapshot "omarchy-snapshot is missing (Omarchy snapshots need the Limine bootloader), so every try will be refused (OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 overrides)"
+  fi
+  if has pacman; then good pacman "found (package changes are reported)"; else bad pacman "missing (package changes are not reported)"; fi
+  if has flock; then good flock found; else bad flock "missing (no protection against two runs at once)"; fi
+  if has shellcheck; then good shellcheck found; else echo "  • shellcheck: missing (optional)"; fi
+  if sandbox_ok; then good sandbox "bubblewrap works"; else bad sandbox "bubblewrap missing or unusable: repo tests will not run (omarchy-pkg-add bubblewrap)"; fi
+  cur=$(current_link_path)
+  if [[ -n "$cur" ]]; then echo "  • current dev-link: $cur"; else echo "  • no dev-link at the moment"; fi
+  if has omarchy-version; then echo "  • Omarchy $(omarchy-version 2>/dev/null || echo '?')"; fi
+  echo "  • repo: $REPO"
+  echo
+  if (( ok )); then echo "All good."; else echo "Fix the ✗ items above first."; fi
+}
+
+cmd_install() {
+  local bin="$HOME/.local/bin" apps="$HOME/.local/share/applications" dest
+  mkdir -p "$bin" "$apps"
+  dest="$bin/omarchy-pr-try"
+  if [[ ! "$SELF" -ef "$dest" ]]; then install -m755 "$SELF" "$dest"; fi
+  if [[ "$dest" =~ [[:space:]\"\'\\\`\$] ]]; then
+    die "'$dest' has characters I cannot put safely in a launcher file"
+  fi
+  cat >"$apps/omarchy-pr-try.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Try an Omarchy PR
+Comment=Browse open PRs, check their risk, and try one safely
+Exec=$dest
+Terminal=true
+Icon=utilities-terminal
+Categories=Development;
+EOF
+  if has update-desktop-database; then update-desktop-database "$apps" >/dev/null 2>&1 || true; fi
+  echo "Installed: $dest"
+  echo "Launcher added: look for 'Try an Omarchy PR' in the app launcher."
+  case ":$PATH:" in
+    *":$bin:"*) ;;
+    *) echo "Note: $bin is not in your PATH, so the 'omarchy-pr-try' command will not be found." ;;
+  esac
+  echo
+  echo "Optional keybinding. Omarchy configures Hyprland in Lua. Apps live on the"
+  echo "Super + Shift plane, so pick a key that is free there:"
+  echo "  omarchy menu keybindings --print"
+  echo "Then add this to ~/.config/hypr/bindings.lua (use o.rebind if the key is taken):"
+  echo "  o.bind(\"SUPER + SHIFT + <key>\", \"Try an Omarchy PR\", \"xdg-terminal-exec $dest\")"
+  echo "And check it: hyprctl reload && hyprctl configerrors"
+}
+
+# ---------------------------------------------------------------- menu
+
+gum_has() { # subcommand flag: does this gum know the flag?
+  local help
+  help=$(gum "$1" --help 2>&1 || true)
+  [[ "$help" == *"$2"* ]]
+}
+
+ui_clear() { if is_tty; then printf '\033[H\033[2J'; fi; }
+
+ui_cols() { local c; c=$(tput cols 2>/dev/null || echo 80); [[ "$c" =~ ^[0-9]+$ ]] || c=80; echo "$c"; }
+
+ui_banner() {
+  local ver=""
+  if has omarchy-version; then ver=$(omarchy-version 2>/dev/null | head -n1 | sanitize || true); fi
+  gum style --border rounded --border-foreground "$C_ACCENT" --padding "0 2" --margin "1 0 1 0" -- \
+    "$(paint 1 'Omarchy PR Try')  $(paint 2 "v$VERSION")" \
+    "$(paint 2 "$REPO${ver:+  ·  Omarchy $ver}")"
+}
+
+ui_status() {
+  local phase title risk dot
+  if [[ -f "$ACTIVE" ]]; then
+    phase=$(meta phase); risk=$(meta risk)
+    title=$(meta title | sanitize)
+    if [[ "$phase" == linked ]]; then dot=$(paint 32 '●'); else dot=$(paint 33 '●'); fi
+    printf '  %s  %s %s\n' "$dot" "$(paint 1 "PR #$(meta pr) is active")" "${risk:+$(badge "$risk")}"
+    printf '     %s\n' "$title"
+    printf '     %s\n' "$(paint 2 "commit $(meta sha | cut -c1-7)  ·  base $(meta base)  ·  since $(meta started | cut -c1-16 | tr T ' ')")"
+    case "$phase" in
+      restored) printf '     %s\n' "$(paint 33 'your config is restored; choose "Go back to normal" to finish')" ;;
+      linking)  printf '     %s\n' "$(paint 33 'the switch did not finish; choose "Go back to normal" to undo it')" ;;
+    esac
+  else
+    printf '  %s  %s\n' "$(paint 2 '○')" "$(paint 2 'No PR active. You are on your own config.')"
+  fi
+  echo
+}
+
+# Used by the spinner: writes the open PRs as TSV (empty fields become "-",
+# because bash's read would squash empty tab-separated fields). Errors land in
+# the same file so the menu can show them.
+cmd_pr_tsv() { # file
+  { list_tsv | sanitize | awk -F'\t' 'BEGIN { OFS = "\t" } { for (i = 1; i <= 7; i++) if ($i == "") $i = "-"; print }'; } >"$1" 2>&1
+}
+
+declare -A PRINFO=()   # PR number -> title, author, draft, size, checks, base (tab separated)
+PICKED=""
+
+# Sets PICKED to the PR number you chose. Returns 1 on cancel or error.
+pick_pr() {
+  local tmp num title author draft size checks base icon t a z tpad apad cols tw line lines="" hdr choice
+  local args=()
+  PICKED=""
+  tmp=$(mktemp)
+  CLEANUP_FILES+=("$tmp")
+  if is_tty; then
+    gum spin --title "Loading open PRs…" -- "$SELF" __pr-tsv "$tmp" || { sed 's/^/  /' "$tmp" >&2; pause; return 1; }
+  else
+    "$SELF" __pr-tsv "$tmp" || { sed 's/^/  /' "$tmp" >&2; return 1; }
+  fi
+
+  cols=$(ui_cols)
+  tw=$((cols - 66))
+  if (( cols < 110 )); then tw=$((cols - 38)); fi
+  if (( tw < 20 )); then tw=20; fi
+  if (( tw > 64 )); then tw=64; fi
+  PRINFO=()
+  while IFS=$'\t' read -r num title author draft size checks base _; do
+    [[ "$num" =~ ^[0-9]+$ ]] || continue
+    PRINFO[$num]="$title"$'\t'"$author"$'\t'"$draft"$'\t'"$size"$'\t'"$checks"$'\t'"$base"
+    case "$checks" in pass) icon="✓" ;; fail) icon="✗" ;; pending) icon="…" ;; "?") icon="?" ;; *) icon="–" ;; esac
+    t="$title"
+    if (( ${#t} > tw )); then t="${t:0:tw-1}…"; fi
+    printf -v tpad '%*s' $((tw - ${#t})) ''
+    a="@$author"
+    if (( ${#a} > 16 )); then a="${a:0:15}…"; fi
+    printf -v apad '%*s' $((16 - ${#a})) ''
+    z="$size"
+    if [[ "$z" == - ]]; then z=""; fi
+    if (( cols < 110 )); then
+      printf -v line '#%-6s %s  %s%s  %s' "$num" "$icon" "$t" "$tpad" "${base:+→ $base}"
+    else
+      printf -v line '#%-6s %s  %s%s  %s%s  %-11s  %s' "$num" "$icon" "$t" "$tpad" "$a" "$apad" "$z" "${base:+→ $base}"
+    fi
+    if [[ "$draft" == draft ]]; then line+="  [draft]"; fi
+    lines+="$line"$'\n'
+  done <"$tmp"
+  if [[ -z "$lines" ]]; then echo "  no open PRs found" >&2; pause; return 1; fi
+
+  hdr="Open PRs in $REPO    ✓ checks pass   ✗ failing   … running   – no checks"
+  if gum_has filter --header; then args+=(--header "$hdr"); fi
+  choice=$(printf '%s' "$lines" | gum filter "${args[@]}" --placeholder "Filter by number, title or author…") || return 1
+  PICKED=$(sed -E 's/^#([0-9]+).*/\1/' <<<"$choice")
+  [[ "$PICKED" =~ ^[0-9]+$ ]]
+}
+
+pr_card() { # pr
+  local raw="${PRINFO[$1]:-}" title author draft size checks base stat l2 w
+  w=$(( $(ui_cols) - 4 ))
+  if [[ -n "$raw" ]]; then
+    IFS=$'\t' read -r title author draft size checks base <<<"$raw"
+    case "$checks" in
+      pass)    stat=$(paint 32 '✓ checks pass') ;;
+      fail)    stat=$(paint 31 '✗ checks failing') ;;
+      pending) stat=$(paint 33 '… checks running') ;;
+      *)       stat=$(paint 2 '– no check info') ;;
+    esac
+    l2="@$author  ·  into $base"
+    if [[ "$size" != - ]]; then l2+="  ·  $size"; fi
+    if [[ "$draft" == draft ]]; then l2+="  ·  draft"; fi
+    gum style --border rounded --border-foreground "$C_ACCENT" --padding "0 2" --margin "1 0 1 0" --width "$w" -- \
+      "$(paint 1 "#$1  $title")" "$(paint 2 "$l2")" "$stat"
+  else
+    gum style --border rounded --border-foreground "$C_ACCENT" --padding "0 2" --margin "1 0 1 0" --width "$w" -- \
+      "$(paint 1 "PR #$1")" "$(paint 2 "https://github.com/$REPO/pull/$1")"
+  fi
+}
+
+# The risk summary with a spinner while the PR downloads, colors kept.
+risk_view() { # pr
+  local out rc=0
+  out=$(mktemp)
+  CLEANUP_FILES+=("$out")
+  if is_tty; then
+    gum spin --title "Fetching PR #$1 and scanning it…" -- \
+      bash -c 'OMARCHY_PR_FORCE_COLOR=1 "$0" risk "$1" >"$2" 2>&1' "$SELF" "$1" "$out" || rc=$?
+  else
+    "$SELF" risk "$1" >"$out" 2>&1 || rc=$?
+  fi
+  cat "$out"
+  return "$rc"
+}
+
+history_view() {
+  local rows args=()
+  if [[ ! -s "$HISTORY" ]]; then echo "  no PRs tried yet"; return 0; fi
+  if ! gum_has table --print; then cmd_history; return 0; fi
+  rows=$(sort -r "$HISTORY" | awk -F'\t' 'BEGIN { OFS = "|" } {
+    when = substr($1, 1, 16); sub("T", " ", when)
+    v = $4
+    if (v == "good") v = "✓ good"; else if (v == "problems") v = "✗ problems"
+    else if (v == "unsure") v = "? unsure"; else v = "– unrated"
+    title = $5; note = $6; risk = $8
+    gsub(/\|/, "/", title); gsub(/\|/, "/", note)
+    if (note == "") note = "-"
+    if (risk == "") risk = "-"
+    print when, "#" $2, $3, v, title, note, risk }')
+  if gum_has table --lazy-quotes; then args+=(--lazy-quotes); fi
+  printf '%s\n' "$rows" | gum table --print --separator "|" "${args[@]}" \
+    --columns "WHEN,PR,SHA,VERDICT,TITLE,NOTE,RISK"
+}
+
+pr_menu() {
+  local pr="$1" act
+  while true; do
+    ui_clear
+    pr_card "$pr"
+    act=$(gum choose --header "What do you want to do?" \
+      "Risk summary         scan the changes for risky patterns" \
+      "Run checks           syntax checks, plus the repo's tests in a sandbox" \
+      "Try this PR          take a snapshot, then switch this machine to it" \
+      "Comment: it works    post a 'tested, works for me' note" \
+      "Comment: problem     tell the author what went wrong" \
+      "Open on GitHub" \
+      "Back") || return 0
+    case "$act" in
+      "Risk summary"*)     risk_view "$pr" || true; pause ;;
+      "Run checks"*)       "$SELF" test "$pr" || true; pause ;;
+      "Comment: it works"*) "$SELF" comment "$pr" "" good || true; pause ;;
+      "Comment: problem"*) "$SELF" comment "$pr" || true; pause ;;
+      "Try this PR"*)
+        "$SELF" try "$pr" || { echo "  ! 'try' failed for PR #$pr; see the errors above."; pause; continue; }
+        pause
+        if [[ -f "$ACTIVE" ]]; then return 0; fi
+        ;;
+      "Open on GitHub"*)
+        xdg-open "https://github.com/$REPO/pull/$pr" >/dev/null 2>&1 \
+          || echo "Open: https://github.com/$REPO/pull/$pr"
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+tui() {
+  need gum
+  # The tool is designed to be installed (omarchy-pr-try install) so it lives
+  # in your PATH and shows in the app launcher. Warn once if it is being run
+  # from an obscure full path instead.
+  if [[ ! "$SELF" =~ ^(/usr|/opt)/ ]] \
+     && [[ ! "$SELF" =~ ^/home/[A-Za-z0-9_-]+/.local/bin/ ]] \
+     && [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+    warn "omarchy-pr-try is being run from $SELF; consider 'omarchy-pr-try install' so it is in your PATH"
+  fi
+  local choice pr
+  while true; do
+    ui_clear
+    ui_banner
+    ui_status
+    if [[ -f "$ACTIVE" ]]; then
+      choice=$(gum choose --header "What next?" \
+        "Go back to normal    undo the switch and restore your config" \
+        "History              PRs you have tried" \
+        "Doctor               check that everything this tool needs is there" \
+        "Quit") || return 0
+    else
+      choice=$(gum choose --header "What next?" \
+        "Browse open PRs      pick one, scan it, test it, try it" \
+        "Try a PR number" \
+        "History              PRs you have tried" \
+        "Doctor               check that everything this tool needs is there" \
+        "Clean up downloads   delete downloaded PR code and saved copies" \
+        "Quit") || return 0
+    fi
+    case "$choice" in
+      "Go back to normal"*) "$SELF" back || true; pause ;;
+      "Browse open PRs"*)
+        if pick_pr; then pr_menu "$PICKED"; fi
+        ;;
+      "Try a PR number"*)
+        pr=$(gum input --placeholder "PR number" --prompt "# ") || continue
+        if [[ "$pr" =~ ^[0-9]+$ ]]; then pr_menu "$pr"; else echo "  That is not a number."; pause; fi
+        ;;
+      "History"*) history_view; pause ;;
+      "Verify active PR"*) "$SELF" verify || true; pause ;;
+      "Doctor"*) "$SELF" doctor || true; pause ;;
+      "Clean up"*) "$SELF" clean || true; pause ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- main
+
+want_pr() { [[ $# -ge 2 ]] || die "usage: omarchy-pr-try $1 N"; }
+
+theme_gum
+
+case "${1:-}" in
+  "")            tui ;;
+  __pr-tsv)      cmd_pr_tsv "${2:?}" ;;
+  list)          cmd_list ;;
+  risk)          want_pr "$@"; cmd_risk "$2" ;;
+  test)          want_pr "$@"; cmd_test "$2" ;;
+  try)           want_pr "$@"; try_pr "$2" "${3:-}" ;;
+  comment)       want_pr "$@"; cmd_comment "$2" "${3:-}" "${4:-}" ;;
+  clean)         cmd_clean ;;
+  back)          back ;;
+  status)        cmd_status | colorize ;;
+  verify)        cmd_verify | colorize ;;
+  history)       cmd_history ;;
+  doctor)        cmd_doctor | colorize ;;
+  install)       cmd_install ;;
+  version|--version) echo "omarchy-pr-try $VERSION" ;;
+  -h|--help|help) usage ;;
+  [0-9]*)        try_pr "$1" "${2:-}" ;;
+  *)             usage; exit 1 ;;
+esac

