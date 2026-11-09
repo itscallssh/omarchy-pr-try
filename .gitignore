@@ -1,0 +1,5 @@
+# State and downloads created while testing PRs
+.cache/omarchy-pr-try/
+.local/state/omarchy-pr-try/
+# Draft comment files
+.local/state/omarchy-pr-try/drafts/

@@ -1,0 +1,24 @@
+{
+  "version": "0.3.2",
+  "name": "omarchy-pr-try",
+  "description": "Test Omarchy PRs safely on your own machine",
+  "license": "MIT",
+  "author": "itscallssh",
+  "source": "https://github.com/itscallssh/omarchy-pr-try",
+  "changelog": [
+    {
+      "version": "0.3.2",
+      "date": "2026-11-09",
+      "changes": [
+        "Force-push detection now runs before the risk scan (warns and requires confirmation)",
+        "Menu try failures are no longer silently swallowed",
+        "New verification block after linking showing PR is active and how to verify it",
+        "New verify subcommand and menu item",
+        "Explained graphical-session reload requirement in the reboot flow",
+        "Install hint when run from an obscure path",
+        "Better back output pointing to where downloaded PR code lives",
+        "162-test suite passes"
+      ]
+    }
+  ]
+}
