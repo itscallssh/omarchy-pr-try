@@ -52,7 +52,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
   exit 1
 fi
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 REPO="${OMARCHY_PR_REPO:-omacom/omarchy}"
 REMOTE="${OMARCHY_PR_REMOTE:-https://github.com/$REPO.git}"
@@ -1968,7 +1968,7 @@ cmd_verify() {
     else
       echo "All of the PR's files are in place and nothing hides them."
     fi
-    return 0
+    return "$rc"
   fi
   cur_link=$(current_link_path)
   if [[ -n "$cur_link" ]]; then
@@ -2126,12 +2126,17 @@ ui_banner() {
 }
 
 ui_status() {
-  local phase title risk dot
+  local phase title risk dot max badge_txt
+  max=$(( $(ui_cols) - 6 ))
+  if (( max < 20 )); then max=20; fi
   if [[ -f "$ACTIVE" ]]; then
-    phase=$(meta phase); risk=$(meta risk)
+    phase=$(meta phase); phase=${phase:-linked}; risk=$(meta risk)
     title=$(meta title | sanitize)
+    if (( ${#title} > max )); then title="${title:0:max-1}…"; fi
     if [[ "$phase" == linked ]]; then dot=$(paint 32 '●'); else dot=$(paint 33 '●'); fi
-    printf '  %s  %s %s\n' "$dot" "$(paint 1 "PR #$(meta pr) is active")" "${risk:+$(badge "$risk")}"
+    badge_txt=""
+    if [[ -n "$risk" ]]; then badge_txt=" $(badge "$risk")"; fi
+    printf '  %s  %s%s\n' "$dot" "$(paint 1 "PR #$(meta pr) is active")" "$badge_txt"
     printf '     %s\n' "$title"
     printf '     %s\n' "$(paint 2 "commit $(meta sha | cut -c1-7)  ·  base $(meta base)  ·  since $(meta started | cut -c1-16 | tr T ' ')")"
     case "$phase" in
@@ -2210,7 +2215,7 @@ pick_pr() {
   done <"$tmp"
   if [[ -z "$lines" ]]; then echo "  no open PRs found" >&2; pause; return 1; fi
 
-  hdr="Open PRs in $REPO    ✓ checks pass   ✗ failing   … running   – no checks"
+  hdr="Open PRs in $REPO    ✓ checks pass   ✗ failing   … running   – no checks   ? unknown"
   if gum_has filter --header; then args+=(--header "$hdr"); fi
   choice=$(printf '%s' "$lines" | gum filter "${args[@]}" --placeholder "Filter by number, title or author…") || return 1
   PICKED=$(sed -E 's/^#([0-9]+).*/\1/' <<<"$choice")
@@ -2218,10 +2223,14 @@ pick_pr() {
 }
 
 pr_card() { # pr
-  local raw="${PRINFO[$1]:-}" title author draft size checks base stat l2 w
+  local raw="${PRINFO[$1]:-}" title author draft size checks base stat l2 w tmax
   w=$(( $(ui_cols) - 4 ))
+  if (( w < 20 )); then w=20; fi
   if [[ -n "$raw" ]]; then
     IFS=$'\t' read -r title author draft size checks base <<<"$raw"
+    tmax=$(( w - 4 ))
+    if (( tmax < 10 )); then tmax=10; fi
+    if (( ${#title} > tmax )); then title="${title:0:tmax-1}…"; fi
     case "$checks" in
       pass)    stat=$(paint 32 '✓ checks pass') ;;
       fail)    stat=$(paint 31 '✗ checks failing') ;;
@@ -2334,6 +2343,7 @@ tui() {
         "Browse open PRs      pick one, scan it, test it, try it" \
         "Search ALL PRs       find any PR by words — open, closed, merged" \
         "Try a PR number" \
+        "Verify active PR     check the dev-link and Omarchy's files" \
         "History              PRs you have tried" \
         "Doctor               check that everything this tool needs is there" \
         "Clean up downloads   delete downloaded PR code and saved copies" \

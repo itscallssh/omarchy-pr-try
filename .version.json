@@ -1,11 +1,21 @@
 {
-  "version": "0.4.0",
+  "version": "0.4.1",
   "name": "omarchy-pr-try",
   "description": "Test Omarchy PRs safely on your own machine",
   "license": "MIT",
   "author": "itscallssh",
   "source": "https://github.com/itscallssh/omarchy-pr-try",
   "changelog": [
+    {
+      "version": "0.4.1",
+      "date": "2026-11-20",
+      "changes": [
+        "verify now exits non-zero when a file is not in place or another command hides it",
+        "The menu offers Verify active PR when no PR is active, as documented",
+        "Long PR titles are truncated and the PR card width is clamped, so narrow terminals no longer break the layout",
+        "The PR picker's check legend explains the '?' (unknown) status"
+      ]
+    },
     {
       "version": "0.4.0",
       "date": "2026-11-09",

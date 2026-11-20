@@ -665,6 +665,7 @@ expect_has "no reboot is needed" "says no reboot is needed"
 expect_has "restart it to see the change" "says the shell must be restarted for QML"
 expect_lacks "Reboot now" "does not offer a reboot"
 run verify
+expect_rc 0 "verify exits 0 when everything is in place"
 expect_has "mode: system" "verify shows the mode"
 expect_has "All of the PR's files are in place and nothing hides them." "verify is happy"
 run status
@@ -673,6 +674,7 @@ mkdir -p "$T/shadow"; printf '#!/usr/bin/env bash\n' >"$T/shadow/omarchy-new"; c
 OLDP="$PATH"; PATH="$T/shadow:$PATH"
 run verify
 PATH="$OLDP"
+expect_rc 1 "verify exits non-zero when something is wrong"
 expect_has "your shell runs omarchy-new from $T/shadow" "verify catches a command hidden earlier in PATH"
 expect_has "Something above is not as it should be" "and says so"
 rm -rf "$T/shadow"
@@ -842,6 +844,28 @@ expect_has "omarchy-pr-try try N" "help prints"
 expect_lacks "Environment" "help stops before the environment notes"
 run risk abc
 expect_rc 1 "a non-number PR is rejected"
+
+section "menu: Verify active PR is offered with and without an active PR"
+# A gum stand-in that records the menu items and picks "Quit".
+cat >"$STUB/bin/gum" <<'EOF'
+#!/usr/bin/env bash
+cmd=$1; shift
+case "$cmd" in
+  choose) printf '%s\n' "$@" >"$STUB/gum-choose"; echo "Quit" ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$STUB/bin/gum"
+reset_world
+run
+expect_rc 0 "the menu quits cleanly with no PR active"
+expect "offers Verify active PR when no PR is active" grep -q '^Verify active PR' "$STUB/gum-choose"
+runy try 1
+run
+expect_rc 0 "the menu quits cleanly with a PR active"
+expect "offers Verify active PR when a PR is active" grep -q '^Verify active PR' "$STUB/gum-choose"
+runy back
+rm -f "$STUB/bin/gum" "$STUB/gum-choose"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

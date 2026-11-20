@@ -1,3 +1,32 @@
+# Fixes in v0.4.1: the menu and verify reports
+
+## What was wrong
+
+1. **`verify` always exited 0.** In system mode it ran `sys_check`, printed a wrong-file
+   warning, and then returned 0 regardless. A script (or the CI-style use of the command)
+   could not tell a good install from a broken one.
+2. **No "Verify active PR" in the menu when nothing was active.** The docs and the v0.3.2
+   notes say it is in both states; only the active-PR menu had it.
+3. **The card and status line broke on narrow terminals.** `pr_card` used the terminal
+   width minus 4 without a floor, and long PR titles (Omarchy PRs often have them) were
+   never truncated, so the card could overflow or fail with a negative width.
+4. **The picker legend did not explain `?`**, the status used when the list came from the
+   public API without check information.
+
+## What changed
+
+- `cmd_verify` returns the result of `sys_check` (non-zero when a file is not the PR's
+  version, a removed file is still there, or an earlier `PATH` command hides it).
+- The inactive menu offers "Verify active PR", which checks the dev-link and the packaged
+  Omarchy layout.
+- `ui_status` truncates a long PR title to the terminal width; `pr_card` clamps its width
+  (minimum 20 columns) and truncates the title to fit.
+- The picker legend gains `? unknown`.
+- 280-test suite passes (6 new assertions: verify exit status and the menu item in both
+  states).
+
+---
+
 # Fixes in v0.4.0: the PR now goes into the real system
 
 ## What was wrong
