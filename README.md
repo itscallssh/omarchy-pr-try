@@ -118,6 +118,15 @@ files, and the PR seems not to be there. `--link` is still available (`try N --l
 
 ## Changelog
 
+### v0.4.1 (2026-11-20)
+
+- `verify` now exits non-zero when a file is missing, replaced, or hidden by another
+  command in `PATH` (it used to always exit 0, so scripts could not tell)
+- **Verify active PR** is offered in the menu when no PR is active too, as documented
+- Long PR titles are truncated and the PR card width is clamped, so the card and status
+  line stay readable on narrow terminals
+- The PR picker's legend now explains the `?` (unknown) check status
+
 ### v0.4.0 (2026-11-09)
 
 - **`try` now installs the PR's files into the real system** (`/usr/bin`, `/usr/share/omarchy`,
