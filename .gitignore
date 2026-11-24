@@ -3,3 +3,4 @@
 .local/state/omarchy-pr-try/
 # Draft comment files
 .local/state/omarchy-pr-try/drafts/
+__pycache__/
