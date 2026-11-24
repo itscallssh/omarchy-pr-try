@@ -6,6 +6,22 @@ Inspect Omarchy pull requests, test them in a verified sandbox, try one on your 
 
 > A clean scan, a passing sandbox run or a green GitHub CI is **never** proof that a PR is safe. This tool makes testing recoverable and honest about what was and was not exercised; it does not make untrusted code trustworthy.
 
+## Screenshots
+
+| Dashboard | A PR is active |
+|---|---|
+| ![Dashboard](docs/screenshots/1-dashboard.png) | ![PR active](docs/screenshots/2-dashboard-active.png) |
+
+| Narrow terminal (44 columns) | CRITICAL risk scan |
+|---|---|
+| ![Narrow](docs/screenshots/3-dashboard-narrow.png) | ![Risk scan](docs/screenshots/4-risk-critical.png) |
+
+| RESTORE ORIGINAL OMARCHY | verify-recovery |
+|---|---|
+| ![Restore](docs/screenshots/5-restore.png) | ![Verify recovery](docs/screenshots/6-verify-recovery.png) |
+
+<sub>Rendered from the tool's real coloured output in the hermetic test environment (fake GitHub remote, fake root). In the risk scan, PR #2's title carried terminal escape codes; the escape bytes were stripped, so the leftover text is harmless.</sub>
+
 ## The three modes
 
 Every command says which mode it is in before it does anything. Nothing ever switches mode silently.
