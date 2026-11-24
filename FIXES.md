@@ -1,3 +1,20 @@
+# Fixes in v0.5.0: security, recovery and honesty
+
+## What was wrong
+1. **Config was sourced.** `current_link_path()` ran `source /etc/omarchy.conf`, so anything that could write that file ran code in the tool.
+2. **Root work as inline shell.** `sys_apply`/`sys_restore` passed shell strings to `sudo`; paths were not re-checked as root and symlinks in destinations were followed.
+3. **Partial rollback.** If writing the PR's config files failed after the first one, already-written config files and all system files stayed changed (the USER_REL bug).
+4. **Silent bypasses.** Five environment variables switched off the risk gate, the snapshot requirement, sandbox isolation and network isolation.
+5. **No commit pinning at apply time.** A PR could change between review and application.
+6. **Sandbox not verified.** A bubblewrap that did not isolate (or was missing) led to running PR tests on the host.
+7. **Escape injection.** PR titles, file names and API text reached the terminal unsanitized.
+8. **Overclaiming.** "Tested" was recorded even when most of a PR could not be exercised live.
+
+## What changed
+Each item above is fixed and has regression tests; see RELEASE-v0.5.0.md and README "Security model" / "Recovery model".
+
+---
+
 # Fixes in v0.4.1: the menu and verify reports
 
 ## What was wrong

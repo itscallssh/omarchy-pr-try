@@ -1,11 +1,32 @@
 {
-  "version": "0.4.1",
+  "version": "0.5.0",
   "name": "omarchy-pr-try",
-  "description": "Test Omarchy PRs safely on your own machine",
+  "description": "Inspect, sandbox-test and try Omarchy PRs with verified recovery",
   "license": "MIT",
   "author": "itscallssh",
   "source": "https://github.com/itscallssh/omarchy-pr-try",
   "changelog": [
+    {
+      "version": "0.5.0",
+      "date": "2026-11-24",
+      "changes": [
+        "Three explicit modes: inspection (read only), sandbox testing, live system testing; never switched silently",
+        "Privileged work moved to a narrow Python helper (allowlisted paths, O_NOFOLLOW, staged-file checksums, atomic writes, checksummed journal, content-addressed originals); no inline sudo shell",
+        "/etc/omarchy.conf is parsed, never sourced",
+        "Live application requires a pinned commit, re-checked against GitHub immediately before any change; force-pushes, merges and closures are reported",
+        "Bypass variables OMARCHY_PR_ALLOW_HIGH, OMARCHY_PR_ALLOW_NO_SNAPSHOT, OMARCHY_PR_UNSAFE_TEST, OMARCHY_PR_TEST_NET are ignored; scoped exceptions only via ~/.config/omarchy-pr-try/policy.conf (PR@exact-commit, mode 600)",
+        "CRITICAL risk level; every finding has file, line, excerpt, why, impact and action; risk --json; shell syntax-tree analysis via shfmt",
+        "Sandbox: bubblewrap with every namespace, empty home, cleared environment, no capabilities, time/memory limits, isolation verified from inside before tests run; network only with --net and confirmation",
+        "Fixed: a failure while writing user config left system files and earlier config files changed; the whole transaction is now rolled back and verified",
+        "Transactions: durable manifest, checkpoint record, archive; idempotent restore with verification; verify-recovery command; orphaned transactions recovered",
+        "Preflight: pacman lock, omarchy update lock, free space, bootloader, version compatibility, state permissions",
+        "Compatibility engine with categories and Coverage FULL/PARTIAL/NONE; results never claim full coverage when parts were not exercised",
+        "New dashboard with the Omarchy mark, theme colours, NO_COLOR, narrow-terminal layouts; GO BACK TO ORIGINAL OMARCHY first while active",
+        "MARK AS TESTED / REPORT PROBLEM recorded locally first; comments previewed, secret-checked, never approvals",
+        "Terminal-escape and Unicode-control sanitization of all PR and API text; hardened git (https/file only, no hooks)",
+        "Test suite: existing assertions kept or tightened, about 200 new assertions over 40 regression scenarios"
+      ]
+    },
     {
       "version": "0.4.1",
       "date": "2026-11-20",
